@@ -165,7 +165,7 @@ dependencies {
     includeDependency("net.ccbluex:netty-httpserver:2.2.1")
 
     // Discord RPC Support
-    includeDependency("com.github.CCBlueX:DiscordIPC:4.0.0")
+    includeDependency("com.github.CCBlueX:DiscordIPC:4.0.1")
 
     // ScriptAPI
     includeDependency("net.fabricmc:tiny-mappings-parser:0.3.0+build.17")
