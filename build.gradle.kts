@@ -28,7 +28,7 @@ plugins {
     // git-properties plugin disabled: project extracted from zip without a .git directory.
     // ClientUpdate.kt falls back to "unofficial" when git.properties is missing, so this is safe.
     // id("com.gorylenko.gradle-git-properties") version "2.5.2"
-    id("io.gitlab.arturbosch.detekt") version "1.23.6"
+    id("io.gitlab.arturbosch.detekt") version "1.23.8"
     id("com.github.node-gradle.node") version "7.1.0"
     id("org.jetbrains.dokka") version "1.9.10"
 }
