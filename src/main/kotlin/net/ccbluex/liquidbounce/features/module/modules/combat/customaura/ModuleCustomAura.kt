@@ -1,0 +1,454 @@
+/*
+ * CustomAura module — a Polar-optimized KillAura rewrite.
+ *
+ * Key differences vs. the stock ModuleKillAura:
+ *  - NEVER uses SNAP / ON_TICK rotation timing (those trigger Polar AimA/B).
+ *    Only NORMAL rotation timing is allowed, so the rotation always arrives
+ *    via the regular PlayerMoveC2SPacket flow, never as a duplicate Full packet.
+ *  - No dual PlayerMoveC2SPacket on attack → no BadPackets duplicate flag.
+ *  - No simulateInventoryClosing → no BadPackets close/open flag.
+ *  - Optional AutoBlock is restricted to vanilla STOP_USING_ITEM only,
+ *    never ChangeSlot / Hypixel / Interact (those are direct Polar flags).
+ *  - Criticals are achieved via jump-crits only, never via stop-sprint
+ *    (Polar Criticals B detects sprint-stop-then-hit).
+ *  - GCD-safe angle smooth is used by default (Polar AimB / GCD check).
+ *  - Adaptive reach optimization so we always strike at maximum safe range,
+ *    out-clicking cheaters who use shorter / less accurate reach.
+ *  - Anti-cheater target prioritizer — detects enemy cheaters by their
+ *    rotation snap patterns and prioritizes them, so we out-click them.
+ */
+@file:Suppress("WildcardImport", "MagicNumber")
+package net.ccbluex.liquidbounce.features.module.modules.combat.customaura
+
+import net.ccbluex.liquidbounce.event.Sequence
+import net.ccbluex.liquidbounce.event.events.RotationUpdateEvent
+import net.ccbluex.liquidbounce.event.events.SprintEvent
+import net.ccbluex.liquidbounce.event.events.WorldRenderEvent
+import net.ccbluex.liquidbounce.event.handler
+import net.ccbluex.liquidbounce.event.tickHandler
+import net.ccbluex.liquidbounce.config.types.NamedChoice
+import net.ccbluex.liquidbounce.features.module.Category
+import net.ccbluex.liquidbounce.features.module.ClientModule
+import net.ccbluex.liquidbounce.features.module.modules.combat.ModuleAutoWeapon
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAntiCheater
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAutoBlock
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraFailSwing
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraPolarBypass
+import net.ccbluex.liquidbounce.render.renderEnvironmentForWorld
+import net.ccbluex.liquidbounce.utils.aiming.RotationManager
+import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
+import net.ccbluex.liquidbounce.utils.aiming.data.RotationWithVector
+import net.ccbluex.liquidbounce.utils.aiming.point.PointTracker
+import net.ccbluex.liquidbounce.utils.aiming.preference.LeastDifferencePreference
+import net.ccbluex.liquidbounce.utils.aiming.utils.facingEnemy
+import net.ccbluex.liquidbounce.utils.aiming.utils.raytraceBox
+import net.ccbluex.liquidbounce.utils.aiming.utils.raytraceEntity
+import net.ccbluex.liquidbounce.utils.combat.CombatManager
+import net.ccbluex.liquidbounce.utils.combat.attack
+import net.ccbluex.liquidbounce.utils.combat.shouldBeAttacked
+import net.ccbluex.liquidbounce.utils.entity.rotation
+import net.ccbluex.liquidbounce.utils.entity.squaredBoxedDistanceTo
+import net.ccbluex.liquidbounce.utils.inventory.InventoryManager
+import net.ccbluex.liquidbounce.utils.kotlin.Priority
+import net.ccbluex.liquidbounce.utils.kotlin.random
+import net.ccbluex.liquidbounce.utils.render.WorldTargetRenderer
+import net.minecraft.client.gui.screen.ingame.GenericContainerScreen
+import net.minecraft.client.util.math.MatrixStack
+import net.minecraft.entity.Entity
+import net.minecraft.entity.LivingEntity
+import kotlin.math.pow
+
+/**
+ * CustomAura — Polar-bypass KillAura with anti-cheater prioritization.
+ *
+ * Design goals (in priority order):
+ *  1. Survive Polar: never produce a flaggable packet sequence.
+ *  2. Out-click competing cheaters via higher effective hit-rate at max safe reach.
+ *  3. Stay smooth enough to look like a human on replay review.
+ */
+object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = arrayOf("CustomKillAura")) {
+
+    /**
+     * Click scheduler — humanized CPS with micro-jitter.
+     */
+    val clickScheduler = tree(CustomAuraClicker)
+
+    /**
+     * Range — kept strictly inside vanilla 4.5 to avoid Reach flags.
+     * A small randomized component is added per-tick so Polar cannot
+     * correlate attack distance to a fixed value (Reach GCD check).
+     */
+    internal val range by float("Range", 3.85f, 1f..4.4f)
+    internal val wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
+        // Wall range must never exceed main range and is kept low by default
+        // because hitting through walls triggers Polar AimC / Reach through-wall.
+        if (v > range) range else v
+    }
+
+    /**
+     * Per-attack reach jitter — adds up to ±0.05 blocks of randomization
+     * to the effective strike distance so Polar's Reach sample distribution
+     * looks noisy instead of pinned to a constant.
+     */
+    private val reachJitter by float("ReachJitter", 0.05f, 0f..0.2f)
+
+    /**
+     * Extra scan range is used only to keep the target tracker warm when the
+     * enemy is slightly outside strike range — we never attack at this range.
+     */
+    private val scanExtraRange by floatRange("ScanExtraRange", 0.5f..1.0f, 0f..3f).onChanged { r ->
+        currentScanExtraRange = r.random()
+    }
+    private var currentScanExtraRange: Float = scanExtraRange.random()
+
+    /**
+     * Target tracker — extends the base tracker with anti-cheater detection.
+     */
+    val targetTracker = tree(CustomAuraTargetTracker)
+    val antiCheater = tree(CustomAuraAntiCheater)
+
+    /**
+     * Rotation engine — uses PolarBypass processor stack by default.
+     */
+    private val rotations = tree(CustomAuraRotationsConfigurable)
+    private val polarBypass = tree(CustomAuraPolarBypass)
+    private val pointTracker = tree(PointTracker())
+
+    private val requires by multiEnumChoice<CustomAuraRequirements>("Requires")
+    private val requirementsMet
+        get() = requires.all { it.meets() }
+
+    /**
+     * Raycast mode — TRACE_ALL is safest: server sees us hit whatever is
+     * actually under the crosshair, which matches the client raytrace.
+     * TRACE_ONLYENEMY is riskier (Polar can correlate target-switch patterns).
+     */
+    internal val raycast by enumChoice("Raycast", RaycastMode.TRACE_ALL)
+
+    /**
+     * Criticals — JUMP_ONLY is the only safe mode under Polar.
+     * STOP_SPRINT (the SMART mode in stock KillAura) is detected by
+     * Polar Criticals B because it observes sprint=true → sprint=false
+     * right before an attack packet.
+     */
+    private val criticalsMode by enumChoice("Criticals", CriticalsMode.JUMP_ONLY)
+    private val keepSprint by boolean("KeepSprint", false)
+
+    /**
+     * Inventory handling — NEVER simulate closing. The stock behavior of
+     * sending CloseHandledScreenC2SPacket(0) before an attack is a direct
+     * BadPackets flag on Polar.
+     */
+    internal val ignoreOpenInventory by boolean("IgnoreOpenInventory", false)
+
+    init {
+        tree(CustomAuraAutoBlock)
+        tree(CustomAuraFailSwing)
+    }
+
+    /**
+     * Target rendering — same as stock, no behavior change.
+     */
+    private val targetRenderer = tree(WorldTargetRenderer(this))
+
+    override fun disable() {
+        targetTracker.reset()
+        antiCheater.reset()
+        CustomAuraAutoBlock.stopBlocking()
+    }
+
+    @Suppress("unused")
+    private val renderHandler = handler<WorldRenderEvent> { event ->
+        renderTarget(event.matrixStack, event.partialTicks)
+    }
+
+    private fun renderTarget(matrixStack: MatrixStack, partialTicks: Float) {
+        val target = targetTracker.target ?: return
+        if (!targetRenderer.enabled) return
+
+        renderEnvironmentForWorld(matrixStack) {
+            targetRenderer.render(this, target, partialTicks)
+        }
+    }
+
+    /**
+     * Rotation update — runs on the rotation update event, BEFORE movement
+     * packets are sent. This is the only safe place to set rotation targets
+     * under Polar, because the resulting rotation will be sent in the normal
+     * PlayerMoveC2SPacket flow (no duplicate packets).
+     */
+    @Suppress("unused")
+    private val rotationUpdateHandler = handler<RotationUpdateEvent> {
+        val isInInventoryScreen =
+            InventoryManager.isInventoryOpen || mc.currentScreen is GenericContainerScreen
+
+        val shouldResetTarget = player.isSpectator || player.isDead || !requirementsMet
+
+        if ((isInInventoryScreen && !ignoreOpenInventory) || shouldResetTarget) {
+            targetTracker.reset()
+            return@handler
+        }
+
+        // Anti-cheater statistics are updated automatically by the
+        // CustomAuraAntiCheater tick handler on every game tick, so we
+        // don't need to trigger it manually here. The latest cheater
+        // scores are already available via antiCheater.score(entity).
+
+        updateTarget()
+        ModuleAutoWeapon.prepare(targetTracker.target)
+    }
+
+    /**
+     * Game tick — performs the actual attack if conditions are met.
+     *
+     * IMPORTANT: we NEVER send an extra PlayerMoveC2SPacket here. The
+     * rotation used for the attack is the one currently registered with
+     * RotationManager, which has already been transmitted to the server
+     * in the normal movement packet flow. This is the single most
+     * important Polar bypass in this module.
+     */
+    @Suppress("unused")
+    private val gameHandler = tickHandler {
+        if (player.isDead || player.isSpectator) return@tickHandler
+
+        val target = targetTracker.target
+
+        if (CombatManager.shouldPauseCombat) {
+            CustomAuraAutoBlock.stopBlocking()
+            return@tickHandler
+        }
+
+        if (target == null) {
+            CustomAuraAutoBlock.stopBlocking()
+            if (CustomAuraFailSwing.enabled && requirementsMet) {
+                CustomAuraFailSwing.dealWithFakeSwing(this, null)
+            }
+            return@tickHandler
+        }
+
+        if (!requirementsMet) return@tickHandler
+
+        // Always use the current server-acknowledged rotation.
+        // Never compute a fresh rotation on the tick of the attack.
+        val rotation = (RotationManager.currentRotation ?: player.rotation).normalize()
+
+        val crosshairTarget = when (raycast) {
+            RaycastMode.TRACE_NONE -> target
+            else -> {
+                raytraceEntity(range.toDouble(), rotation, filter = {
+                    when (raycast) {
+                        RaycastMode.TRACE_ONLYENEMY -> it.shouldBeAttacked()
+                        RaycastMode.TRACE_ALL -> true
+                        else -> false
+                    }
+                })?.entity ?: target
+            }
+        }
+
+        if (crosshairTarget is LivingEntity && crosshairTarget.shouldBeAttacked()
+            && crosshairTarget != target) {
+            targetTracker.target = crosshairTarget
+        }
+
+        attackTarget(this, crosshairTarget, rotation)
+    }
+
+    /**
+     * Sprint handler — only blocks sprint when we are about to jump-crit,
+     * which is the legitimate vanilla criticals path (jump → fall → hit).
+     * We NEVER block sprint just to force a fake critical.
+     */
+    val shouldBlockSprinting
+        get() = criticalsMode == CriticalsMode.JUMP_ONLY
+            && clickScheduler.isClickTick
+            && targetTracker.target != null
+            && !player.isOnGround
+
+    @Suppress("unused")
+    private val sprintHandler = handler<SprintEvent> { event ->
+        if (shouldBlockSprinting && (event.source == SprintEvent.Source.MOVEMENT_TICK ||
+                event.source == SprintEvent.Source.INPUT)) {
+            event.sprint = false
+        }
+    }
+
+    /**
+     * Core attack routine. Compared to stock KillAura:
+     *  - No inventory close/open dance.
+     *  - No dual PlayerMoveC2SPacket on ON_TICK timing.
+     *  - No stop-sprint-then-hit criticals.
+     *  - Reach jitter is applied to the effective range on every strike.
+     */
+    @Suppress("CognitiveComplexMethod")
+    private suspend fun attackTarget(sequence: Sequence, target: Entity, rotation: Rotation) {
+        CustomAuraAutoBlock.makeSeemBlock()
+
+        // Apply per-tick reach jitter so the strike distance is noisy.
+        val jitter = ((Math.random() * 2.0 - 1.0) * reachJitter.toDouble()).toFloat()
+        val effectiveRange = (range + jitter).coerceIn(2.5f, 4.4f)
+
+        val isFacingEnemy = facingEnemy(
+            toEntity = target, rotation = rotation,
+            range = effectiveRange.toDouble(),
+            wallsRange = wallRange.toDouble()
+        )
+
+        if (!isFacingEnemy) {
+            // Only block on scan range if AutoBlock is enabled AND enemy is
+            // close enough to threaten us — avoids needless block packets.
+            if (CustomAuraAutoBlock.enabled && CustomAuraAutoBlock.onScanRange &&
+                player.squaredBoxedDistanceTo(target) <= (range + currentScanExtraRange).pow(2)) {
+                CustomAuraAutoBlock.startBlocking()
+                return
+            }
+
+            CustomAuraAutoBlock.stopBlocking()
+
+            if (CustomAuraFailSwing.enabled) {
+                CustomAuraFailSwing.dealWithFakeSwing(sequence, target)
+            }
+            return
+        }
+
+        // Strike — click scheduler gates the actual hit.
+        if (clickScheduler.isClickTick && validateAttack(target)) {
+            clickScheduler.attack(sequence, rotation) {
+                if (!validateAttack(target)) return@attack false
+
+                // Jump-crit check: only claim a critical if we are actually
+                // in the air (vanilla critical mechanics). Polar verifies
+                // the onGround flag in the previous PlayerMoveC2SPacket.
+                val wantsCrit = criticalsMode == CriticalsMode.JUMP_ONLY
+                if (wantsCrit && player.isOnGround) {
+                    // Wait one tick so we leave the ground before striking.
+                    return@attack false
+                }
+
+                target.attack(true, keepSprint && !shouldBlockSprinting)
+                currentScanExtraRange = scanExtraRange.random()
+                true
+            }
+        } else {
+            CustomAuraAutoBlock.startBlocking()
+        }
+    }
+
+    /**
+     * Target selection. Uses the anti-cheater score to break ties so we
+     * prefer killing cheaters when multiple enemies are in range.
+     */
+    private fun updateTarget() {
+        val situation = when {
+            clickScheduler.isClickTick || clickScheduler.willClickAt(1) ->
+                PointTracker.AimSituation.FOR_NEXT_TICK
+            else -> PointTracker.AimSituation.FOR_THE_FUTURE
+        }
+
+        val maximumRange = if (targetTracker.closestSquaredEnemyDistance > range.pow(2)) {
+            range + currentScanExtraRange
+        } else {
+            range
+        }
+
+        val squaredMaxRange = maximumRange.pow(2)
+        val squaredNormalRange = range.pow(2)
+
+        // Build candidate list with cheater score, then sort by:
+        //   1. Cheater score (desc) — out-click cheaters first.
+        //   2. In-range (in normal range first).
+        //   3. Distance (asc).
+        val candidates = targetTracker.targets()
+            .filter { it.squaredBoxedDistanceTo(player) <= squaredMaxRange }
+            .sortedWith(compareByDescending<LivingEntity> { antiCheater.score(it) }
+                .thenBy { if (it.squaredBoxedDistanceTo(player) <= squaredNormalRange) 0 else 1 }
+                .thenBy { it.squaredBoxedDistanceTo(player) })
+
+        val target = candidates.firstOrNull { processTarget(it, maximumRange, situation) }
+
+        if (target != null) {
+            targetTracker.target = target
+        } else {
+            targetTracker.reset()
+        }
+    }
+
+    @Suppress("ReturnCount")
+    private fun processTarget(
+        entity: LivingEntity,
+        maximumRange: Float,
+        situation: PointTracker.AimSituation
+    ): Boolean {
+        val (rotation, _) = getSpot(entity, maximumRange.toDouble(), situation) ?: return false
+
+        // NORMAL rotation timing only — we always push the rotation target
+        // through RotationManager and let the normal packet flow deliver it.
+        RotationManager.setRotationTarget(
+            rotations.toBypassedRotationTarget(
+                rotation,
+                entity,
+                considerInventory = !ignoreOpenInventory
+            ),
+            priority = Priority.IMPORTANT_FOR_USAGE_2,
+            provider = this@ModuleCustomAura
+        )
+        return true
+    }
+
+    /**
+     * Best spot to strike. Same raytrace logic as stock, but the rotation
+     * is then post-processed by the PolarBypass processor stack.
+     */
+    private fun getSpot(
+        entity: LivingEntity,
+        range: Double,
+        situation: PointTracker.AimSituation
+    ): RotationWithVector? {
+        val point = pointTracker.gatherPoint(entity, situation)
+        val eyes = point.fromPoint
+        val nextPoint = point.toPoint
+
+        val rotationPreference = LeastDifferencePreference.leastDifferenceToLastPoint(eyes, nextPoint)
+
+        val spot = raytraceBox(
+            eyes, point.cutOffBox,
+            range = range,
+            wallsRange = wallRange.toDouble(),
+            rotationPreference = rotationPreference
+        ) ?: raytraceBox(
+            eyes, point.box,
+            range = range,
+            wallsRange = wallRange.toDouble(),
+            rotationPreference = rotationPreference
+        )
+
+        return spot
+    }
+
+    /**
+     * Validate that the attack can land a critical (if jump-crits are on)
+     * and that we are not in an inventory screen we cannot ignore.
+     */
+    internal fun validateAttack(target: Entity? = null): Boolean {
+        val criticalHit = target == null || player.isGliding ||
+            criticalsMode != CriticalsMode.JUMP_ONLY ||
+            !player.isOnGround  // in air = can crit
+        val isInInventoryScreen = InventoryManager.isInventoryOpen ||
+            mc.currentScreen is GenericContainerScreen
+
+        return criticalHit && !(isInInventoryScreen && !ignoreOpenInventory)
+    }
+
+    enum class RaycastMode(override val choiceName: String) : NamedChoice {
+        TRACE_NONE("None"),
+        TRACE_ONLYENEMY("Enemy"),
+        TRACE_ALL("All")
+    }
+
+    enum class CriticalsMode(override val choiceName: String) : NamedChoice {
+        /** Vanilla jump-criticals only. Safe under Polar. */
+        JUMP_ONLY("JumpOnly"),
+
+        /** No critical enforcement at all. Safest, lowest damage. */
+        NONE("None")
+    }
+}

@@ -35,6 +35,7 @@ import net.ccbluex.liquidbounce.features.module.modules.combat.crystalaura.Modul
 import net.ccbluex.liquidbounce.features.module.modules.combat.elytratarget.ModuleElytraTarget
 import net.ccbluex.liquidbounce.features.module.modules.combat.killaura.ModuleKillAura
 import net.ccbluex.liquidbounce.features.module.modules.combat.killaura1_8.ModuleKillAura1_8
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
 import net.ccbluex.liquidbounce.features.module.modules.combat.tpaura.ModuleTpAura
 import net.ccbluex.liquidbounce.features.module.modules.combat.velocity.ModuleVelocity
 import net.ccbluex.liquidbounce.features.module.modules.exploit.*
@@ -202,6 +203,7 @@ object ModuleManager : EventListener, Iterable<ClientModule> by modules {
             ModuleHitbox,
             ModuleKillAura,
             ModuleKillAura1_8,
+            ModuleCustomAura,
             ModuleTpAura,
             ModuleSuperKnockback,
             ModuleTimerRange,
