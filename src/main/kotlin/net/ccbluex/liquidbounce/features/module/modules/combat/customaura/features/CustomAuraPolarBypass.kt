@@ -62,9 +62,9 @@ import kotlin.random.Random
  * discouraged on Polar-protected servers.
  */
 object CustomAuraPolarBypass : ToggleableConfigurable(
-    owner = ModuleCustomAura,
+    parent = ModuleCustomAura,
     name = "PolarBypass",
-    default = true
+    enabled = true
 ), RotationProcessor {
 
     /**

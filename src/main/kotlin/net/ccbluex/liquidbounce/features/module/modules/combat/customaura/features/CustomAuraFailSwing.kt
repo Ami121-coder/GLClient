@@ -38,9 +38,9 @@ import net.minecraft.util.hit.HitResult
 import kotlin.math.pow
 
 internal object CustomAuraFailSwing : ToggleableConfigurable(
-    owner = ModuleCustomAura,
+    parent = ModuleCustomAura,
     name = "FailSwing",
-    default = false
+    enabled = false
 ) {
     /**
      * Capped additional range — kept small to avoid swinging at "nothing"

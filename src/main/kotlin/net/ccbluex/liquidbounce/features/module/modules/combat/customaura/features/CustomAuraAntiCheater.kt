@@ -44,9 +44,9 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 object CustomAuraAntiCheater : ToggleableConfigurable(
-    owner = ModuleCustomAura,
+    parent = ModuleCustomAura,
     name = "AntiCheater",
-    default = true
+    enabled = true
 ) {
     /**
      * Per-entity tracking state. Keyed by entity ID so we don't hold
@@ -115,7 +115,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         }
 
         // Prune stale entries.
-        val cutoff = player.age - 200  // 10 seconds
+        val cutoff = player.age.toLong() - 200L  // 10 seconds
         states.entries.removeIf { it.value.lastUpdateTick < cutoff }
     }
 
@@ -179,7 +179,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         // Long-range hits — checked in [recordAttack].
         state.lastYaw = currentYaw
         state.lastPitch = currentPitch
-        state.lastUpdateTick = player.age
+        state.lastUpdateTick = player.age.toLong()
     }
 
     /**

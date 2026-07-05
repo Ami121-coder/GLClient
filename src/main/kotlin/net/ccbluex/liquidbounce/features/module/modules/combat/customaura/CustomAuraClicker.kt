@@ -53,7 +53,7 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
         if (!isClickTick) return
 
         // Honor post-hit pause.
-        if (player.age < pausedUntilTick) return
+        if (player.age.toLong() < pausedUntilTick) return
 
         // Make sure we are not stuck blocking — but use vanilla stop only.
         if (player.isBlockAction) {
@@ -72,7 +72,7 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
 
         // Schedule the next pause if the click landed.
         if (clickAmount != null && clickAmount!! > 0) {
-            pausedUntilTick = player.age + postHitPause.random().toLong()
+            pausedUntilTick = player.age.toLong() + postHitPause.random().toLong()
         }
     }
 

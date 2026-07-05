@@ -42,9 +42,9 @@ import net.minecraft.item.consume.UseAction
 import net.minecraft.util.Hand
 
 object CustomAuraAutoBlock : ToggleableConfigurable(
-    owner = ModuleCustomAura,
+    parent = ModuleCustomAura,
     name = "AutoBlocking",
-    default = false
+    enabled = false
 ) {
     /**
      * Only BASIC and FAKE modes are offered.
