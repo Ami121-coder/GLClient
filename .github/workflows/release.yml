@@ -1,0 +1,170 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'build.gradle.kts'
+      - 'gradle.properties'
+      - 'settings.gradle.kts'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v0.31.0-customaura)'
+        required: false
+        default: ''
+      release_name:
+        description: 'Release name'
+        required: false
+        default: 'CustomAura Build'
+      is_prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setting up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Grant permissions to src-theme
+        run: sudo chmod -R 777 src-theme
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: wrapper
+
+      - name: Build with Gradle
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew genSources build remapJar -x test -x detekt --no-daemon --stacktrace
+
+      - name: Collect build info
+        id: info
+        run: |
+          function gradleprop {
+              grep "^${1}=" gradle.properties | cut -d'=' -f2
+          }
+          LB_VERSION=$(gradleprop 'mod_version')
+          MINECRAFT_VERSION=$(gradleprop 'minecraft_version')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "lb_version=$LB_VERSION" >> $GITHUB_OUTPUT
+          echo "mc_version=$MINECRAFT_VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "build_date=$(date +'%Y-%m-%d_%H-%M')" >> $GITHUB_OUTPUT
+
+      - name: Find built JAR
+        id: jar
+        run: |
+          cd build/libs
+          # Find the main remapped jar (not sources, not dev)
+          JAR=$(find . -maxdepth 1 -type f -name "*.jar" ! -name "*-sources.jar" ! -name "*-dev.jar" ! -name "*-shadow.jar" | head -1)
+          if [ -z "$JAR" ]; then
+            # Fallback: any liquidbounce jar
+            JAR=$(find . -maxdepth 1 -type f -name "liquidbounce*.jar" | head -1)
+          fi
+          if [ -z "$JAR" ]; then
+            echo "ERROR: No JAR found in build/libs"
+            ls -la
+            exit 1
+          fi
+          JAR_BASENAME=$(basename "$JAR")
+          echo "Found JAR: $JAR_BASENAME"
+          # Copy with a clean, versioned name for release
+          NEW_NAME="liquidbounce-${{ steps.info.outputs.lb_version }}-mc${{ steps.info.outputs.mc_version }}-${{ steps.info.outputs.short_sha }}.jar"
+          cp "$JAR_BASENAME" "$NEW_NAME"
+          echo "jar_path=build/libs/$NEW_NAME" >> $GITHUB_OUTPUT
+          echo "jar_name=$NEW_NAME" >> $GITHUB_OUTPUT
+          ls -la
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquidbounce-customaura-jar
+          path: ${{ steps.jar.outputs.jar_path }}
+          retention-days: 30
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          INPUT_TAG="${{ github.event.inputs.release_tag }}"
+          if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" = "" ]; then
+            # Auto-generate: v<version>-<short_sha>
+            TAG="v${{ steps.info.outputs.lb_version }}-${{ steps.info.outputs.short_sha }}"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Will create release with tag: $TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.event.inputs.release_name || format('CustomAura Build {0}', steps.tag.outputs.tag) }}
+          body: |
+            # CustomAura Build
+
+            **Commit:** `${{ steps.info.outputs.short_sha }}`
+            **Build date:** ${{ steps.info.outputs.build_date }}
+            **LiquidBounce version:** ${{ steps.info.outputs.lb_version }}
+            **Minecraft version:** ${{ steps.info.outputs.mc_version }}
+
+            ## Installation
+            1. Download the `.jar` file below
+            2. Place it in your Minecraft `mods/` folder
+            3. Requires Fabric Loader + Fabric API + Fabric Kotlin
+            4. Launch Minecraft 1.21.4 with Fabric
+
+            ## What's included
+            - CustomAura module — Polar-optimized KillAura with anti-cheater prioritization
+            - PolarBypass rotation processor (GCD-safe noise, sinusoidal drift, delta clamp)
+            - AntiCheater target prioritization (snap detection, CPS tracking, perfect-tracking)
+            - Vanilla-only AutoBlock (no Hypixel/Interact/ChangeSlot flag patterns)
+
+            > Built automatically from commit `${{ github.sha }}`.
+          files: ${{ steps.jar.outputs.jar_path }}
+          prerelease: ${{ github.event.inputs.is_prerelease == 'true' || github.event.inputs.is_prerelease == '' }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ steps.info.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build date | ${{ steps.info.outputs.build_date }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LB version | ${{ steps.info.outputs.lb_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MC version | ${{ steps.info.outputs.mc_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JAR file | \`${{ steps.jar.outputs.jar_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release tag | \`${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
