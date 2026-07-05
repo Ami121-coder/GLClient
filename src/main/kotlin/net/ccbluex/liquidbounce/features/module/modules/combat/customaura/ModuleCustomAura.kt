@@ -21,6 +21,7 @@
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura
 
 import net.ccbluex.liquidbounce.event.Sequence
+import net.ccbluex.liquidbounce.event.events.MovementInputEvent
 import net.ccbluex.liquidbounce.event.events.RotationUpdateEvent
 import net.ccbluex.liquidbounce.event.events.SprintEvent
 import net.ccbluex.liquidbounce.event.events.WorldRenderEvent
@@ -359,6 +360,24 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     }
 
     /**
+     * Flag set by [attackTarget] when we want to auto-jump for a critical
+     * on the next movement tick. The actual jump is triggered via
+     * [MovementInputEvent] (see [movementInputHandler]) so it goes through
+     * the vanilla input pipeline — Polar's jump-input correlation check
+     * sees a legitimate jump input, not a velocity-only teleport.
+     */
+    @Volatile
+    private var pendingAutoJump: Boolean = false
+
+    @Suppress("unused")
+    private val movementInputHandler = handler<MovementInputEvent> {
+        if (pendingAutoJump && player.isOnGround) {
+            it.jump = true
+            pendingAutoJump = false
+        }
+    }
+
+    /**
      * Core attack routine. Compared to stock KillAura:
      *  - No inventory close/open dance.
      *  - No dual PlayerMoveC2SPacket on ON_TICK timing.
@@ -456,15 +475,19 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             //  - player is on ground (can't jump while in air)
             //  - at least 600ms since the last auto-jump (rate limit)
             //  - we're about to click THIS tick
-            // The jump is sent via the vanilla jump input, so the movement
-            // packet will have onGround=false on the next tick → crit.
+            //
+            // IMPLEMENTATION: We set the [pendingAutoJump] flag instead of
+            // calling player.jump() directly. The [movementInputHandler]
+            // picks up the flag on the next MovementInputEvent and sets
+            // event.jump = true. This routes the jump through the vanilla
+            // input pipeline, so Polar's jump-input correlation check sees
+            // a legitimate jump input — not a velocity-only teleport.
+            // The movement packet on the next tick will have onGround=false → crit.
             if (autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
                 player.isOnGround && targetTracker.target != null) {
                 val now = System.currentTimeMillis()
                 if (now - lastAutoJumpMs >= 600L) {
-                    // Trigger a vanilla jump by setting the jump input flag.
-                    // The movement tick will pick this up and send a jump.
-                    player.jump()
+                    pendingAutoJump = true
                     lastAutoJumpMs = now
                 }
             }

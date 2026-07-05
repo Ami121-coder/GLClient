@@ -37,18 +37,25 @@ import net.ccbluex.liquidbounce.utils.client.player
 import net.ccbluex.liquidbounce.utils.aiming.RotationManager
 import net.ccbluex.liquidbounce.utils.entity.rotation
 import java.io.File
+import java.io.FileWriter
 import java.io.PrintWriter
 import java.io.StringWriter
-import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 object ModuleCustomAuraDebugger : ClientModule(
     "CustomAuraDebug",
     Category.MISC,
-    aliases = arrayOf("CustomAuraDebugger", "CADebug")
+    aliases = arrayOf("CustomAuraDebugger", "CADebug"),
+    disableOnQuit = true
 ) {
 
     /**
@@ -109,8 +116,13 @@ object ModuleCustomAuraDebugger : ClientModule(
     /**
      * Thread-safe ring buffer. ConcurrentLinkedDeque so we can append
      * from any thread without locking.
+     *
+     * NOTE: We do NOT use [ConcurrentLinkedDeque.size] for capacity
+     * management because it is O(n). Instead we track the count with
+     * [ringBufferCount] (AtomicInteger) which is O(1).
      */
     private val ringBuffer = ConcurrentLinkedDeque<AttackEvent>()
+    private val ringBufferCount = AtomicInteger(0)
 
     /**
      * Statistics counters. AtomicLong so they are thread-safe.
@@ -121,9 +133,11 @@ object ModuleCustomAuraDebugger : ClientModule(
     private val totalFailed = AtomicLong(0)
 
     /**
-     * Skip-reason histogram. AtomicInteger so incrementAndGet is atomic.
+     * Skip-reason histogram. Uses ConcurrentHashMap so we can read and
+     * write without explicit synchronization. Values are AtomicInteger
+     * so incrementAndGet is atomic.
      */
-    private val skipReasons = mutableMapOf<String, AtomicInteger>()
+    private val skipReasons = ConcurrentHashMap<String, AtomicInteger>()
 
     /**
      * PolarBypass clamp monitor — counts how often the per-tick yaw
@@ -135,10 +149,23 @@ object ModuleCustomAuraDebugger : ClientModule(
 
     /**
      * Log file writer. Lazily initialized when logToFile is true.
+     *
+     * Opened in APPEND mode (FileWriter(file, true)) so history survives
+     * across client restarts — critical for post-mortem analysis after
+     * a crash or kick.
      */
     private var logFile: File? = null
     private var logWriter: PrintWriter? = null
     private var lastFlushMs: Long = 0L
+
+    /**
+     * Background flush scheduler. Runs on wall-clock time (not game ticks)
+     * so logs are flushed even when the game is lagging or paused.
+     */
+    private val flushExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "CustomAuraDebug-flusher").apply { isDaemon = true }
+    }
+    private var flushScheduled = false
 
     /**
      * Last event seen — used by the overlay to render the most recent
@@ -147,11 +174,16 @@ object ModuleCustomAuraDebugger : ClientModule(
     @Volatile
     private var lastEvent: AttackEvent? = null
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
+    /**
+     * Thread-safe date formatter. SimpleDateFormat is NOT thread-safe,
+     * and DateTimeFormatter is immutable so it's safe to share.
+     */
+    private val dateFormat = DateTimeFormatter.ISO_INSTANT.withZone(ZoneId.systemDefault())
 
     override fun enable() {
         super.enable()
         ringBuffer.clear()
+        ringBufferCount.set(0)
         totalAttempts.set(0)
         totalLanded.set(0)
         totalSkipped.set(0)
@@ -164,6 +196,17 @@ object ModuleCustomAuraDebugger : ClientModule(
 
         if (logToFile) {
             openLogFile()
+            // Schedule background flush on wall-clock time so logs are
+            // flushed even when the game is lagging.
+            if (!flushScheduled) {
+                flushExecutor.scheduleAtFixedRate(
+                    { flushLog(force = false) },
+                    flushIntervalMs.toLong(),
+                    flushIntervalMs.toLong(),
+                    TimeUnit.MILLISECONDS
+                )
+                flushScheduled = true
+            }
         }
     }
 
@@ -173,6 +216,7 @@ object ModuleCustomAuraDebugger : ClientModule(
         logWriter?.close()
         logWriter = null
         logFile = null
+        flushScheduled = false
     }
 
     /**
@@ -228,8 +272,9 @@ object ModuleCustomAuraDebugger : ClientModule(
             "SKIPPED" -> {
                 totalSkipped.incrementAndGet()
                 skipReason?.let { reason ->
-                    synchronized(skipReasons) {
-                        skipReasons.getOrPut(reason) { AtomicInteger(0) }.incrementAndGet()
+                    // ConcurrentHashMap.compute is atomic — no synchronized needed.
+                    skipReasons.compute(reason) { _, v ->
+                        (v ?: AtomicInteger(0)).also { it.incrementAndGet() }
                     }
                 }
             }
@@ -237,9 +282,11 @@ object ModuleCustomAuraDebugger : ClientModule(
         }
 
         // Push to ring buffer, evict oldest if over capacity.
+        // Use AtomicInteger counter instead of ringBuffer.size (which is O(n)).
         ringBuffer.addLast(event)
-        while (ringBuffer.size > ringBufferSize) {
+        while (ringBufferCount.incrementAndGet() > ringBufferSize) {
             ringBuffer.pollFirst()
+            ringBufferCount.decrementAndGet()
         }
 
         lastEvent = event
@@ -266,14 +313,10 @@ object ModuleCustomAuraDebugger : ClientModule(
     private val tickHandler = handler<GameTickEvent> {
         if (!running) return@handler
 
-        // Periodic log flush.
-        if (logToFile && logWriter != null) {
-            val now = System.currentTimeMillis()
-            if (now - lastFlushMs >= flushIntervalMs) {
-                flushLog(force = false)
-                lastFlushMs = now
-            }
-        }
+        // NOTE: log flushing is now handled by a ScheduledExecutorService
+        // (see enable()) so it runs on wall-clock time, not game ticks.
+        // This ensures logs are flushed even when the game is lagging
+        // (e.g. on Polar servers under load where TPS can drop to 5).
 
         // PolarBypass health warning — if clamp fires more than 30% of
         // the time over the last 100 process calls, warn in chat.
@@ -282,7 +325,7 @@ object ModuleCustomAuraDebugger : ClientModule(
             if (ratio > 0.30) {
                 // Only warn once per 1000 ticks to avoid spam.
                 if (player.age % 1000 == 0) {
-                    net.ccbluex.liquidbounce.utils.client.chat(
+                    chat(
                         "§e[CustomAuraDebug] §cPolarBypass clamp ratio ${(ratio * 100).toInt()}% — " +
                             "consider lowering your base AngleSmooth speed."
                     )
@@ -333,14 +376,16 @@ object ModuleCustomAuraDebugger : ClientModule(
                 val ratio = pbClampEvents.get() * 100 / pbTotalProcess.get()
                 add("§7PB clamp: §f${pbClampEvents.get()}/${pbTotalProcess.get()} ($ratio%)")
             }
-            synchronized(skipReasons) {
-                val top3 = skipReasons.entries.sortedByDescending { it.value.get() }.take(3)
-                if (top3.isNotEmpty()) {
-                    add("")
-                    add("§7Top skip reasons:")
-                    top3.forEach { (reason, count) ->
-                        add(" §c$reason§7: §f${count.get()}")
-                    }
+            // Skip reasons top 3 — ConcurrentHashMap iteration is weakly consistent
+            // and safe without explicit synchronization.
+            val top3 = skipReasons.entries
+                .sortedByDescending { it.value.get() }
+                .take(3)
+            if (top3.isNotEmpty()) {
+                add("")
+                add("§7Top skip reasons:")
+                top3.forEach { (reason, count) ->
+                    add(" §c$reason§7: §f${count.get()}")
                 }
             }
         }
@@ -365,8 +410,10 @@ object ModuleCustomAuraDebugger : ClientModule(
             if (!dir.exists()) dir.mkdirs()
             val file = File(dir, "customaura-debug.log")
             logFile = file
-            // Append mode — keep history across sessions.
-            logWriter = PrintWriter(file, "UTF-8").apply {
+            // REAL append mode — FileWriter(file, true) opens in append mode,
+            // so history survives across client restarts. The previous
+            // PrintWriter(file, "UTF-8") truncated the file on every open.
+            logWriter = PrintWriter(FileWriter(file, true), true).apply {
                 println("# CustomAura debug log started at ${Date()}")
                 println("# Format: timestamp | tick | phase | skipReason | target | " +
                     "dist | effRange | jitter | facing | clickTick | onGround | validate | yaw | serverYaw")
@@ -375,15 +422,14 @@ object ModuleCustomAuraDebugger : ClientModule(
             lastFlushMs = System.currentTimeMillis()
         } catch (e: Exception) {
             // Don't crash the module if the log can't be opened.
-            net.ccbluex.liquidbounce.utils.client.chat(
-                "§c[CustomAuraDebug] Failed to open log file: ${e.message}"
-            )
+            chat("§c[CustomAuraDebug] Failed to open log file: ${e.message}")
         }
     }
 
     private fun appendToLog(event: AttackEvent) {
         val writer = logWriter ?: return
-        val ts = dateFormat.format(Date(event.timestamp))
+        // DateTimeFormatter is thread-safe (immutable), safe to call from any thread.
+        val ts = dateFormat.format(Instant.ofEpochMilli(event.timestamp))
         val line = buildString {
             append(ts)
             append(" | tick=").append(event.tick)
@@ -400,15 +446,17 @@ object ModuleCustomAuraDebugger : ClientModule(
             event.yaw?.let { append(" | yaw=").append("%.2f".format(it)) }
             event.serverYaw?.let { append(" | serverYaw=").append("%.2f".format(it)) }
         }
-        writer.println(line)
+        // synchronized on logWriter because PrintWriter is not thread-safe
+        // and recordEvent may be called from multiple threads.
+        synchronized(writer) {
+            writer.println(line)
+        }
     }
 
     private fun flushLog(force: Boolean) {
-        logWriter?.let {
-            it.flush()
-            if (force) {
-                // No-op — PrintWriter doesn't need fsync for our purposes.
-            }
+        val writer = logWriter ?: return
+        synchronized(writer) {
+            writer.flush()
         }
     }
 

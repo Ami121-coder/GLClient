@@ -133,7 +133,13 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
 
         // Step 1: clamp the delta from current → target to the per-tick max.
         val clamped = clampDelta(currentRotation, targetRotation)
-        val clampedEngaged = clamped != targetRotation
+        // Accurately detect if the clamp actually engaged by checking the
+        // raw delta vs the threshold. Comparing clamped != targetRotation
+        // is unreliable due to float arithmetic noise — a delta just under
+        // the threshold can still produce a slightly different clamped value.
+        val yawDelta = abs(wrapDegrees(targetRotation.yaw - currentRotation.yaw))
+        val pitchDelta = abs(targetRotation.pitch - currentRotation.pitch)
+        val clampedEngaged = yawDelta > maxYawDelta || pitchDelta > maxPitchDelta
 
         // Step 2: add sinusoidal drift to break perfect-tracking detection.
         val drifted = applyDrift(clamped)
