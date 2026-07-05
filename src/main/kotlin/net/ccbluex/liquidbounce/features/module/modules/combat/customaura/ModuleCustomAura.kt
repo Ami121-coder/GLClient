@@ -34,6 +34,7 @@ import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.featur
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAutoBlock
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraFailSwing
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraPolarBypass
+import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug
 import net.ccbluex.liquidbounce.render.renderEnvironmentForWorld
 import net.ccbluex.liquidbounce.utils.aiming.RotationManager
 import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
@@ -208,6 +209,16 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         val resolved = CustomAuraPresets.resolve(p)
         val params = CustomAuraPresets.paramsFor(resolved)
 
+        // ── DEBUG: preset application ────────────────────────────────
+        ModuleDebug.debugParameter(this, "PresetRequested", p.name)
+        ModuleDebug.debugParameter(this, "PresetResolved", resolved.name)
+        ModuleDebug.debugParameter(this, "PresetRange", params.range)
+        ModuleDebug.debugParameter(this, "PresetWallRange", params.wallRange)
+        ModuleDebug.debugParameter(this, "PresetPolarBypass", params.polarBypassEnabled)
+        ModuleDebug.debugParameter(this, "PresetAutoBlock", params.autoBlockEnabled)
+        ModuleDebug.debugParameter(this, "PresetFailSwing", params.failSwingEnabled)
+        ModuleDebug.debugParameter(this, "PresetAntiCheater", params.antiCheaterEnabled)
+
         // ── Main module settings ─────────────────────────────────────
         range = params.range
         wallRange = params.wallRange
@@ -368,12 +379,38 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             wallsRange = wallRange.toDouble()
         )
 
+        // ── DEBUG: attackTarget diagnostics ─────────────────────────
+        ModuleDebug.debugParameter(this, "Target", target.nameForScoreboard)
+        ModuleDebug.debugParameter(this, "Rotation", rotation)
+        ModuleDebug.debugParameter(this, "EffectiveRange", effectiveRange)
+        ModuleDebug.debugParameter(this, "Jitter", jitter)
+        ModuleDebug.debugParameter(this, "IsFacingEnemy", isFacingEnemy)
+        ModuleDebug.debugParameter(this, "IsClickTick", clickScheduler.isClickTick)
+        ModuleDebug.debugParameter(this, "Preset", preset.name)
+        ModuleDebug.debugParameter(this, "CriticalsMode", criticalsMode.name)
+        ModuleDebug.debugParameter(this, "OnGround", player.isOnGround)
+        ModuleDebug.debugParameter(this, "RequirementsMet", requirementsMet)
+        ModuleDebug.debugParameter(this, "ValidateAttack", validateAttack(target))
+
         if (!isFacingEnemy) {
             // Only block on scan range if AutoBlock is enabled AND enemy is
             // close enough to threaten us — avoids needless block packets.
             if (CustomAuraAutoBlock.enabled && CustomAuraAutoBlock.onScanRange &&
                 player.squaredBoxedDistanceTo(target) <= (range + currentScanExtraRange).pow(2)) {
                 CustomAuraAutoBlock.startBlocking()
+                ModuleCustomAuraDebugger.recordEvent(
+                    phase = "SKIPPED",
+                    skipReason = "not_facing_enemy_blocking",
+                    targetName = target.nameForScoreboard,
+                    targetId = target.id,
+                    targetDistance = player.squaredBoxedDistanceTo(target),
+                    effectiveRange = effectiveRange,
+                    jitter = jitter,
+                    isFacingEnemy = isFacingEnemy,
+                    isClickTick = clickScheduler.isClickTick,
+                    onGround = player.isOnGround,
+                    validateAttack = validateAttack(target)
+                )
                 return
             }
 
@@ -382,11 +419,37 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             if (CustomAuraFailSwing.enabled) {
                 CustomAuraFailSwing.dealWithFakeSwing(sequence, target)
             }
+            ModuleCustomAuraDebugger.recordEvent(
+                phase = "SKIPPED",
+                skipReason = "not_facing_enemy",
+                targetName = target.nameForScoreboard,
+                targetId = target.id,
+                targetDistance = player.squaredBoxedDistanceTo(target),
+                effectiveRange = effectiveRange,
+                jitter = jitter,
+                isFacingEnemy = isFacingEnemy,
+                isClickTick = clickScheduler.isClickTick,
+                onGround = player.isOnGround,
+                validateAttack = validateAttack(target)
+            )
             return
         }
 
         // Strike — click scheduler gates the actual hit.
         if (clickScheduler.isClickTick && validateAttack(target)) {
+            ModuleCustomAuraDebugger.recordEvent(
+                phase = "ATTEMPT",
+                targetName = target.nameForScoreboard,
+                targetId = target.id,
+                targetDistance = player.squaredBoxedDistanceTo(target),
+                effectiveRange = effectiveRange,
+                jitter = jitter,
+                isFacingEnemy = isFacingEnemy,
+                isClickTick = clickScheduler.isClickTick,
+                onGround = player.isOnGround,
+                validateAttack = validateAttack(target)
+            )
+
             // Auto-jump for criticals (optional). Only triggers when:
             //  - autoJumpForCrits is enabled
             //  - criticalsMode is JUMP_ONLY
@@ -407,7 +470,17 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             }
 
             clickScheduler.attack(sequence, rotation) {
-                if (!validateAttack(target)) return@attack false
+                if (!validateAttack(target)) {
+                    ModuleCustomAuraDebugger.recordEvent(
+                        phase = "FAILED",
+                        skipReason = "validate_attack_false_in_click",
+                        targetName = target.nameForScoreboard,
+                        targetId = target.id,
+                        onGround = player.isOnGround,
+                        validateAttack = false
+                    )
+                    return@attack false
+                }
 
                 // ATTACK ALWAYS GOES THROUGH.
                 // With JUMP_ONLY criticals, we do NOT skip the attack when
@@ -418,9 +491,36 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
                 target.attack(true, keepSprint && !shouldBlockSprinting)
                 currentScanExtraRange = scanExtraRange.random()
+
+                ModuleCustomAuraDebugger.recordEvent(
+                    phase = "LANDED",
+                    targetName = target.nameForScoreboard,
+                    targetId = target.id,
+                    targetDistance = player.squaredBoxedDistanceTo(target),
+                    effectiveRange = effectiveRange,
+                    jitter = jitter,
+                    isFacingEnemy = isFacingEnemy,
+                    isClickTick = true,
+                    onGround = player.isOnGround,
+                    validateAttack = true
+                )
                 true
             }
         } else {
+            // Not a click tick or validateAttack failed.
+            ModuleCustomAuraDebugger.recordEvent(
+                phase = "SKIPPED",
+                skipReason = if (!clickScheduler.isClickTick) "not_click_tick" else "validate_attack_false",
+                targetName = target.nameForScoreboard,
+                targetId = target.id,
+                targetDistance = player.squaredBoxedDistanceTo(target),
+                effectiveRange = effectiveRange,
+                jitter = jitter,
+                isFacingEnemy = isFacingEnemy,
+                isClickTick = clickScheduler.isClickTick,
+                onGround = player.isOnGround,
+                validateAttack = validateAttack(target)
+            )
             CustomAuraAutoBlock.startBlocking()
         }
     }
@@ -457,10 +557,22 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
         val target = candidates.firstOrNull { processTarget(it, maximumRange, situation) }
 
+        // ── DEBUG: updateTarget diagnostics ──────────────────────────
+        ModuleDebug.debugParameter(this, "AimSituation", situation.name)
+        ModuleDebug.debugParameter(this, "MaximumRange", maximumRange)
+        ModuleDebug.debugParameter(this, "Range", range)
+        ModuleDebug.debugParameter(this, "Candidates", candidates.size)
+        ModuleDebug.debugParameter(this, "ClosestEnemyDist", targetTracker.closestSquaredEnemyDistance)
+
         if (target != null) {
             targetTracker.target = target
+            ModuleDebug.debugParameter(this, "TargetID", target.id)
+            ModuleDebug.debugParameter(this, "TargetScore", antiCheater.score(target))
+            ModuleDebug.debugParameter(this, "TargetDist", target.squaredBoxedDistanceTo(player))
         } else {
             targetTracker.reset()
+            ModuleDebug.debugParameter(this, "TargetID", "none")
+            ModuleDebug.debugParameter(this, "TargetScore", 0f)
         }
     }
 

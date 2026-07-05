@@ -50,14 +50,33 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
      * the normal movement packet flow.
      */
     suspend fun attack(sequence: Sequence, rotation: Rotation? = null, attack: () -> Boolean) {
-        if (!isClickTick) return
+        if (!isClickTick) {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_SkipReason", "not_click_tick"
+            )
+            return
+        }
 
         // Honor post-hit pause.
-        if (player.age.toLong() < pausedUntilTick) return
+        if (player.age.toLong() < pausedUntilTick) {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_SkipReason", "post_hit_pause"
+            )
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_PausedUntil", pausedUntilTick
+            )
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_PlayerAge", player.age
+            )
+            return
+        }
 
         // Make sure we are not stuck blocking — but use vanilla stop only.
         if (player.isBlockAction) {
             if (!CustomAuraAutoBlock.enabled && !ModuleMultiActions.mayAttackWhileUsing()) {
+                net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                    this, "Clicker_SkipReason", "blocking_no_autoblock"
+                )
                 return
             }
             if (CustomAuraAutoBlock.enabled && CustomAuraAutoBlock.shouldUnblockToHit) {
@@ -73,6 +92,16 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
         // Schedule the next pause if the click landed.
         if (clickAmount != null && clickAmount!! > 0) {
             pausedUntilTick = player.age.toLong() + postHitPause.random().toLong()
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_Landed", clickAmount
+            )
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_PostHitPause", postHitPause.random()
+            )
+        } else {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "Clicker_Landed", 0
+            )
         }
     }
 

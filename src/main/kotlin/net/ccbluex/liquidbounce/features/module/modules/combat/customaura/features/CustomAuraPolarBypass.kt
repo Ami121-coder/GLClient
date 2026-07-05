@@ -133,6 +133,7 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
 
         // Step 1: clamp the delta from current → target to the per-tick max.
         val clamped = clampDelta(currentRotation, targetRotation)
+        val clampedEngaged = clamped != targetRotation
 
         // Step 2: add sinusoidal drift to break perfect-tracking detection.
         val drifted = applyDrift(clamped)
@@ -142,6 +143,39 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
 
         // Step 4: remember the emitted value for the next tick's clamp.
         lastEmittedRotation = noised
+
+        // Report clamp event to the debugger for health monitoring.
+        net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAuraDebugger
+            .recordPolarBypassProcess(currentRotation.yaw, targetRotation.yaw, clampedEngaged)
+
+        // ── DEBUG: PolarBypass process diagnostics ──────────────────
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_CurrentYaw", currentRotation.yaw
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_TargetYaw", targetRotation.yaw
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_ClampedYaw", clamped.yaw
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_DriftedYaw", drifted.yaw
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_NoisedYaw", noised.yaw
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_NoisedPitch", noised.pitch
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_MaxYawDelta", maxYawDelta
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_NoiseStddev", noiseStddev
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "PB_DriftAmp", driftAmplitude
+        )
 
         return noised
     }

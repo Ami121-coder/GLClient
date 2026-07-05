@@ -132,23 +132,67 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
      * session — no Hypixel-style spam.
      */
     fun startBlocking() {
-        if (!enabled || (player.isBlockAction && blockMode == BlockMode.BASIC)) return
+        // ── DEBUG: AutoBlock entry ────────────────────────────────────
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_Enabled", enabled
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_BlockMode", blockMode.name
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_UnblockMode", unblockMode.name
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_BlockingEnforced", blockingStateEnforced
+        )
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_IsBlockAction", player.isBlockAction
+        )
+
+        if (!enabled || (player.isBlockAction && blockMode == BlockMode.BASIC)) {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "AB_SkipReason", "already_blocking_or_disabled"
+            )
+            return
+        }
 
         if (blockMode == BlockMode.FAKE) {
             blockVisual = true
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "AB_SkipReason", "fake_mode_visual_only"
+            )
             return
         }
 
         val blockHand = when {
             canBlock(player.mainHandStack) -> Hand.MAIN_HAND
             canBlock(player.offHandStack) -> Hand.OFF_HAND
-            else -> return
+            else -> {
+                net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                    this, "AB_SkipReason", "no_blockable_hand"
+                )
+                return
+            }
         }
 
         val itemStack = player.getStackInHand(blockHand)
-        if (itemStack.isEmpty || !itemStack.isItemEnabled(world.enabledFeatures)) return
+        if (itemStack.isEmpty || !itemStack.isItemEnabled(world.enabledFeatures)) {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "AB_SkipReason", "item_empty_or_disabled"
+            )
+            return
+        }
 
-        val actionResult = mc.interactionManager?.interactItem(player, blockHand) ?: return
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_BlockHand", blockHand.name
+        )
+
+        val actionResult = mc.interactionManager?.interactItem(player, blockHand) ?: run {
+            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+                this, "AB_SkipReason", "interaction_manager_null"
+            )
+            return
+        }
 
         if (actionResult.isAccepted && actionResult.shouldSwingHand()) {
             currentTickOn = tickOnRange.random()
@@ -157,6 +201,9 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
 
         blockVisual = true
         blockingStateEnforced = true
+        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
+            this, "AB_StartedBlocking", true
+        )
     }
 
     /**
