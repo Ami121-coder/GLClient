@@ -93,6 +93,7 @@ object CustomAuraPresets {
         val scanExtraRangeEnd: Float,
         val raycast: RaycastMode,
         val criticalsMode: CriticalsMode,
+        val autoJumpForCrits: Boolean,
         val keepSprint: Boolean,
         val ignoreOpenInventory: Boolean,
 
@@ -155,6 +156,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = 1.0f,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
+            autoJumpForCrits = false,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -193,6 +195,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = 1.0f,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
+            autoJumpForCrits = false,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -231,6 +234,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = 1.5f,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
+            autoJumpForCrits = true,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -269,6 +273,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = 0.5f,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.NONE,
+            autoJumpForCrits = false,
             keepSprint = true,
             ignoreOpenInventory = false,
 

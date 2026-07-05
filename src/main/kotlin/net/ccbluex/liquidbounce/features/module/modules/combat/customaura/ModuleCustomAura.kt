@@ -130,8 +130,25 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * STOP_SPRINT (the SMART mode in stock KillAura) is detected by
      * Polar Criticals B because it observes sprint=true → sprint=false
      * right before an attack packet.
+     *
+     * With JUMP_ONLY, attacks ALWAYS go through — vanilla Minecraft
+     * decides if it's a critical based on the onGround flag. To actually
+     * GET criticals, enable [autoJumpForCrits] below.
      */
     internal var criticalsMode by enumChoice("Criticals", CriticalsMode.JUMP_ONLY)
+
+    /**
+     * Auto-jump right before an attack to trigger a vanilla critical hit.
+     * OFF by default — auto-jumping with too regular a pattern can be
+     * detected by Polar as a movement anomaly.
+     *
+     * When ON, the aura schedules a jump on the tick before an attack
+     * (only if the player is on ground and JUMP_ONLY criticals are set).
+     * The jump is rate-limited to at most once every 600ms to avoid
+     * triggering any jump-pattern checks.
+     */
+    internal var autoJumpForCrits by boolean("AutoJumpForCrits", false)
+    private var lastAutoJumpMs: Long = 0L
     internal var keepSprint by boolean("KeepSprint", false)
 
     /**
@@ -198,6 +215,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         scanExtraRange = params.scanExtraRangeStart..params.scanExtraRangeEnd
         raycast = params.raycast
         criticalsMode = params.criticalsMode
+        autoJumpForCrits = params.autoJumpForCrits
         keepSprint = params.keepSprint
         ignoreOpenInventory = params.ignoreOpenInventory
 
@@ -369,17 +387,34 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
         // Strike — click scheduler gates the actual hit.
         if (clickScheduler.isClickTick && validateAttack(target)) {
+            // Auto-jump for criticals (optional). Only triggers when:
+            //  - autoJumpForCrits is enabled
+            //  - criticalsMode is JUMP_ONLY
+            //  - player is on ground (can't jump while in air)
+            //  - at least 600ms since the last auto-jump (rate limit)
+            //  - we're about to click THIS tick
+            // The jump is sent via the vanilla jump input, so the movement
+            // packet will have onGround=false on the next tick → crit.
+            if (autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
+                player.isOnGround && targetTracker.target != null) {
+                val now = System.currentTimeMillis()
+                if (now - lastAutoJumpMs >= 600L) {
+                    // Trigger a vanilla jump by setting the jump input flag.
+                    // The movement tick will pick this up and send a jump.
+                    player.jump()
+                    lastAutoJumpMs = now
+                }
+            }
+
             clickScheduler.attack(sequence, rotation) {
                 if (!validateAttack(target)) return@attack false
 
-                // Jump-crit check: only claim a critical if we are actually
-                // in the air (vanilla critical mechanics). Polar verifies
-                // the onGround flag in the previous PlayerMoveC2SPacket.
-                val wantsCrit = criticalsMode == CriticalsMode.JUMP_ONLY
-                if (wantsCrit && player.isOnGround) {
-                    // Wait one tick so we leave the ground before striking.
-                    return@attack false
-                }
+                // ATTACK ALWAYS GOES THROUGH.
+                // With JUMP_ONLY criticals, we do NOT skip the attack when
+                // on ground — vanilla Minecraft decides if it's a critical
+                // based on the onGround flag in the movement packet. If the
+                // player is in the air (from a manual or auto jump), it's
+                // a crit; if on ground, it's a normal hit. Both are legit.
 
                 target.attack(true, keepSprint && !shouldBlockSprinting)
                 currentScanExtraRange = scanExtraRange.random()
@@ -482,17 +517,30 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     }
 
     /**
-     * Validate that the attack can land a critical (if jump-crits are on)
-     * and that we are not in an inventory screen we cannot ignore.
+     * Validate that we are allowed to send an attack packet right now.
+     *
+     * IMPORTANT: This MUST NOT block attacks based on the criticals mode.
+     * The criticals mode only controls whether we force criticals via
+     * stop-sprint (CHEAT — Polar detects it) or let vanilla decide (JUMP_ONLY).
+     * With JUMP_ONLY, attacks ALWAYS go through — vanilla Minecraft decides
+     * if it's a critical based on the onGround flag in the movement packet.
+     *
+     * The previous implementation returned false when JUMP_ONLY + onGround,
+     * which made the aura NEVER attack (since the player is almost always
+     * on ground in normal combat). That was the root cause of the
+     * "target locked but no attacks" bug.
      */
     internal fun validateAttack(target: Entity? = null): Boolean {
-        val criticalHit = target == null || player.isGliding ||
-            criticalsMode != CriticalsMode.JUMP_ONLY ||
-            !player.isOnGround  // in air = can crit
         val isInInventoryScreen = InventoryManager.isInventoryOpen ||
             mc.currentScreen is GenericContainerScreen
 
-        return criticalHit && !(isInInventoryScreen && !ignoreOpenInventory)
+        // Don't attack while gliding (elytra) — vanilla disallows it.
+        if (player.isGliding) return false
+
+        // Don't attack through an inventory screen we can't ignore.
+        if (isInInventoryScreen && !ignoreOpenInventory) return false
+
+        return true
     }
 
     enum class RaycastMode(override val choiceName: String) : NamedChoice {
