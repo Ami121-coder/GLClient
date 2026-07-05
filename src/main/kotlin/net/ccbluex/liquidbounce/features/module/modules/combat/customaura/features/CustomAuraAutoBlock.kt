@@ -52,20 +52,20 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
      *  - FAKE:  visual-only, no packets sent — totally safe but provides
      *           no actual damage reduction.
      */
-    private val blockMode by enumChoice("BlockMode", BlockMode.BASIC)
+    private var blockMode by enumChoice("BlockMode", BlockMode.BASIC)
 
     /**
      * Only STOP_USING_ITEM is offered.
      * CHANGE_SLOT is NOT registered because it is a direct Polar AutoBlock C flag.
      */
-    private val unblockMode by enumChoice("UnblockMode", UnblockMode.STOP_USING_ITEM)
+    private var unblockMode by enumChoice("UnblockMode", UnblockMode.STOP_USING_ITEM)
 
     /**
      * Tick-off delay between unblock and the next attack. Default 0 means
      * we attack on the same tick we unblock, which is the vanilla-accurate
      * behavior. Any non-zero value introduces a noticeable packet pattern.
      */
-    val tickOffRange by intRange("TickOff", 0..0, 0..2, "ticks").onChanged { range ->
+    internal var tickOffRange by intRange("TickOff", 0..0, 0..2, "ticks").onChanged { range ->
         currentTickOff = range.random()
     }
     var currentTickOff: Int = tickOffRange.random()
@@ -74,7 +74,7 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     /**
      * Tick-on delay between block and the next unblock. Default 0.
      */
-    val tickOnRange by intRange("TickOn", 0..0, 0..2, "ticks").onChanged { range ->
+    internal var tickOnRange by intRange("TickOn", 0..0, 0..2, "ticks").onChanged { range ->
         currentTickOn = range.random()
     }
     var currentTickOn: Int = tickOnRange.random()
@@ -184,6 +184,17 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
 
     private fun canBlock(itemStack: ItemStack) =
         itemStack.item?.getUseAction(itemStack) == UseAction.BLOCK
+
+    /**
+     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
+     */
+    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
+        this.enabled = params.autoBlockEnabled
+        blockMode = params.blockMode
+        unblockMode = params.unblockMode
+        tickOffRange = params.tickOffStart..params.tickOffEnd
+        tickOnRange = params.tickOnStart..params.tickOnEnd
+    }
 
     enum class BlockMode(override val choiceName: String) : NamedChoice {
         BASIC("Basic"),

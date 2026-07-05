@@ -46,7 +46,7 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
      * Capped additional range — kept small to avoid swinging at "nothing"
      * from the server's perspective.
      */
-    private val additionalRange by floatRange("AdditionalRange", 1.0f..1.5f, 0f..3f).onChanged { r ->
+    internal var additionalRange by floatRange("AdditionalRange", 1.0f..1.5f, 0f..3f).onChanged { r ->
         currentAdditionalRange = r.random()
     }
 
@@ -56,7 +56,7 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
      * Minimum interval between fail-swings, in milliseconds. Prevents
      * per-tick swing spam.
      */
-    private val minIntervalMs by int("MinInterval", 200, 50..1000, "ms")
+    internal var minIntervalMs by int("MinInterval", 200, 50..1000, "ms")
 
     private var lastSwingTimestamp: Long = 0L
 
@@ -98,5 +98,14 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
             lastSwingTimestamp = System.currentTimeMillis()
             true
         }
+    }
+
+    /**
+     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
+     */
+    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
+        this.enabled = params.failSwingEnabled
+        additionalRange = params.failSwingAdditionalRangeStart..params.failSwingAdditionalRangeEnd
+        minIntervalMs = params.failSwingMinIntervalMs
     }
 }

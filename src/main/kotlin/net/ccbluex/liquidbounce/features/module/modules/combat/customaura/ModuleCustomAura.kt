@@ -78,8 +78,8 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * A small randomized component is added per-tick so Polar cannot
      * correlate attack distance to a fixed value (Reach GCD check).
      */
-    internal val range by float("Range", 3.85f, 1f..4.4f)
-    internal val wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
+    internal var range by float("Range", 3.85f, 1f..4.4f)
+    internal var wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
         // Wall range must never exceed main range and is kept low by default
         // because hitting through walls triggers Polar AimC / Reach through-wall.
         if (v > range) range else v
@@ -90,13 +90,13 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * to the effective strike distance so Polar's Reach sample distribution
      * looks noisy instead of pinned to a constant.
      */
-    private val reachJitter by float("ReachJitter", 0.05f, 0f..0.2f)
+    internal var reachJitter by float("ReachJitter", 0.05f, 0f..0.2f)
 
     /**
      * Extra scan range is used only to keep the target tracker warm when the
      * enemy is slightly outside strike range — we never attack at this range.
      */
-    private val scanExtraRange by floatRange("ScanExtraRange", 0.5f..1.0f, 0f..3f).onChanged { r ->
+    internal var scanExtraRange by floatRange("ScanExtraRange", 0.5f..1.0f, 0f..3f).onChanged { r ->
         currentScanExtraRange = r.random()
     }
     private var currentScanExtraRange: Float = scanExtraRange.random()
@@ -123,7 +123,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * actually under the crosshair, which matches the client raytrace.
      * TRACE_ONLYENEMY is riskier (Polar can correlate target-switch patterns).
      */
-    internal val raycast by enumChoice("Raycast", RaycastMode.TRACE_ALL)
+    internal var raycast by enumChoice("Raycast", RaycastMode.TRACE_ALL)
 
     /**
      * Criticals — JUMP_ONLY is the only safe mode under Polar.
@@ -131,15 +131,31 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * Polar Criticals B because it observes sprint=true → sprint=false
      * right before an attack packet.
      */
-    private val criticalsMode by enumChoice("Criticals", CriticalsMode.JUMP_ONLY)
-    private val keepSprint by boolean("KeepSprint", false)
+    internal var criticalsMode by enumChoice("Criticals", CriticalsMode.JUMP_ONLY)
+    internal var keepSprint by boolean("KeepSprint", false)
 
     /**
      * Inventory handling — NEVER simulate closing. The stock behavior of
      * sending CloseHandledScreenC2SPacket(0) before an attack is a direct
      * BadPackets flag on Polar.
      */
-    internal val ignoreOpenInventory by boolean("IgnoreOpenInventory", false)
+    internal var ignoreOpenInventory by boolean("IgnoreOpenInventory", false)
+
+    /**
+     * Anticheat preset — applies a complete configuration bundle tuned
+     * for a specific anticheat. The default is AUTO, which picks a
+     * concrete preset based on the current server.
+     *
+     * Selecting a preset overwrites ALL tunable settings on this module
+     * and its submodules. This is intentional — a preset is an explicit
+     * user action.
+     *
+     * The flagship preset is **POLAR**, which is the safest configuration
+     * that still deals meaningful damage on Polar-protected servers.
+     */
+    var preset by enumChoice("Preset", CustomAuraPresets.Preset.AUTO).onChanged { p ->
+        applyPreset(p)
+    }
 
     init {
         tree(CustomAuraAutoBlock)
@@ -155,6 +171,47 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         targetTracker.reset()
         antiCheater.reset()
         CustomAuraAutoBlock.stopBlocking()
+    }
+
+    // ── Preset application ──────────────────────────────────────────────────
+
+    /**
+     * Applies a preset's parameter bundle to the module's settings AND
+     * to all submodules (PolarBypass, AutoBlock, FailSwing, AntiCheater).
+     *
+     * Each setting is written via its delegated `setValue` operator,
+     * which calls the underlying `Value.set()` method and triggers any
+     * registered `onChange` listeners.
+     *
+     * Settings that the user has manually overridden since module enable
+     * will be overwritten — this is intentional, since selecting a preset
+     * is an explicit user action.
+     */
+    fun applyPreset(p: CustomAuraPresets.Preset) {
+        val resolved = CustomAuraPresets.resolve(p)
+        val params = CustomAuraPresets.paramsFor(resolved)
+
+        // ── Main module settings ─────────────────────────────────────
+        range = params.range
+        wallRange = params.wallRange
+        reachJitter = params.reachJitter
+        scanExtraRange = params.scanExtraRangeStart..params.scanExtraRangeEnd
+        raycast = params.raycast
+        criticalsMode = params.criticalsMode
+        keepSprint = params.keepSprint
+        ignoreOpenInventory = params.ignoreOpenInventory
+
+        // ── PolarBypass ──────────────────────────────────────────────
+        CustomAuraPolarBypass.applyPreset(params)
+
+        // ── AutoBlock ────────────────────────────────────────────────
+        CustomAuraAutoBlock.applyPreset(params)
+
+        // ── FailSwing ────────────────────────────────────────────────
+        CustomAuraFailSwing.applyPreset(params)
+
+        // ── AntiCheater ──────────────────────────────────────────────
+        CustomAuraAntiCheater.applyPreset(params)
     }
 
     @Suppress("unused")

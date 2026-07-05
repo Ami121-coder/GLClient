@@ -69,22 +69,22 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
      * Yaw delta threshold (degrees per tick) above which we consider the
      * enemy a snap-aimbot. 60° is well above any human capability.
      */
-    private val snapThreshold by float("SnapThreshold", 60f, 30f..180f, "°")
+    internal var snapThreshold by float("SnapThreshold", 60f, 30f..180f, "°")
 
     /**
      * CPS threshold above which we flag the enemy as autoclicker.
      */
-    private val cpsThreshold by float("CpsThreshold", 14f, 8f..20f, "cps")
+    internal var cpsThreshold by float("CpsThreshold", 14f, 8f..20f, "cps")
 
     /**
      * Consecutive ticks of perfect tracking required to flag target-lock.
      */
-    private val trackingTicksThreshold by int("TrackingTicks", 20, 5..60, "ticks")
+    internal var trackingTicksThreshold by int("TrackingTicks", 20, 5..60, "ticks")
 
     /**
      * Reach (in blocks) above which we count a hit as "long range".
      */
-    private val longRangeHit by float("LongRangeHit", 3.8f, 3f..6f, "blocks")
+    internal var longRangeHit by float("LongRangeHit", 3.8f, 3f..6f, "blocks")
 
     /**
      * Score decay per tick — historical flags age out at this rate.
@@ -215,5 +215,16 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         while (d > 180f) d -= 360f
         while (d < -180f) d += 360f
         return d
+    }
+
+    /**
+     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
+     */
+    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
+        this.enabled = params.antiCheaterEnabled
+        snapThreshold = params.snapThreshold
+        cpsThreshold = params.cpsThreshold
+        trackingTicksThreshold = params.trackingTicksThreshold
+        longRangeHit = params.longRangeHit
     }
 }

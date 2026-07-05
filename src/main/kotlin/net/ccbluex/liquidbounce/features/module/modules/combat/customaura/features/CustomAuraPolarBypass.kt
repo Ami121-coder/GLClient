@@ -72,12 +72,12 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
      * high-DPI mice; we cap at 22°/tick to stay clearly inside the
      * envelope. Polar AimA typically trips at ~40°+/tick.
      */
-    private val maxYawDelta by float("MaxYawDelta", 22f, 5f..45f, "°")
+    internal var maxYawDelta by float("MaxYawDelta", 22f, 5f..45f, "°")
 
     /**
      * Maximum per-tick pitch delta. Humans rarely exceed ~15°/tick.
      */
-    private val maxPitchDelta by float("MaxPitchDelta", 15f, 3f..30f, "°")
+    internal var maxPitchDelta by float("MaxPitchDelta", 15f, 3f..30f, "°")
 
     /**
      * GCD-noise standard deviation in degrees. Adds gaussian noise of
@@ -87,20 +87,20 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
      * 0.04° is small enough to never miss the hitbox, large enough to
      * kill GCD detection.
      */
-    private val noiseStddev by float("NoiseStddev", 0.04f, 0f..0.3f, "°")
+    internal var noiseStddev by float("NoiseStddev", 0.04f, 0f..0.3f, "°")
 
     /**
      * Sinusoidal drift amplitude. Adds a slow sinusoidal offset to yaw
      * and pitch so the crosshair never sits perfectly on the target
      * center — defeats AimC "perfect tracking" check.
      */
-    private val driftAmplitude by float("DriftAmplitude", 0.4f, 0f..2f, "°")
+    internal var driftAmplitude by float("DriftAmplitude", 0.4f, 0f..2f, "°")
 
     /**
      * Drift frequency in Hz (oscillations per second). 0.3 Hz means a
      * ~3.3s period — slow enough to look like natural aim wobble.
      */
-    private val driftFrequency by float("DriftFrequency", 0.3f, 0.1f..1.5f, "Hz")
+    internal var driftFrequency by float("DriftFrequency", 0.3f, 0.1f..1.5f, "Hz")
 
     /**
      * Tick counter for the drift oscillator. Uses player.age so it
@@ -224,5 +224,19 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         while (d > 180f) d -= 360f
         while (d < -180f) d += 360f
         return d
+    }
+
+    /**
+     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
+     */
+    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
+        // Toggle enabled state — VANILLA preset disables the bypass entirely.
+        this.enabled = params.polarBypassEnabled
+
+        maxYawDelta = params.maxYawDelta
+        maxPitchDelta = params.maxPitchDelta
+        noiseStddev = params.noiseStddev
+        driftAmplitude = params.driftAmplitude
+        driftFrequency = params.driftFrequency
     }
 }
