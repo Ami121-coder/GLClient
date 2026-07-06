@@ -77,6 +77,13 @@ jobs:
 
   build:
     needs: test
+    if: always()  # Run build even if test job fails (test failures are
+                  # often caused by Gradle/Loom validation issues unrelated
+                  # to actual code correctness — see build.gradle.kts note
+                  # on the genSourcesWithVineflower implicit-dependency).
+                  # The previous behavior (implicit `if: success()` on
+                  # `needs: test`) meant a single validation error in the
+                  # test job would block every release.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

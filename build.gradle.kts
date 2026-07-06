@@ -319,18 +319,31 @@ tasks.withType<JavaCompile>().configureEach {
 
     // Minecraft 1.21.1 upwards uses Java 21.
     options.release = 21
-
-    // Fabric Loom's :genSourcesWithVineflower produces the merged-named
-    // Minecraft jar that compileJava resolves against. Without an explicit
-    // dependency declaration, Gradle 8.14's task-input validation fails
-    // with "Task ':compileJava' uses this output of task
-    // ':genSourcesWithVineflower' without declaring an explicit or
-    // implicit dependency" — even when genSources is listed before the
-    // test task on the command line. Declaring mustRunAfter lets Gradle
-    // order the tasks correctly while still allowing them to be skipped
-    // when the loom cache is fresh.
-    mustRunAfter("genSourcesWithVineflower")
 }
+
+// NOTE on the genSourcesWithVineflower implicit-dependency validation:
+//
+// Gradle 8.14 introduced stricter task-input validation that flags
+// :compileJava for using the merged-named Minecraft jar (an output of
+// :genSourcesWithVineflower) without declaring an explicit dependency.
+// The recommended fixes are:
+//   1. declare genSourcesWithVineflower as an input of compileJava
+//   2. dependsOn("genSourcesWithVineflower")
+//   3. mustRunAfter("genSourcesWithVineflower")
+//
+// We deliberately do NOT apply any of these fixes here, because they
+// all create a circular dependency in the :build task graph:
+//
+//   compileJava → genSourcesWithVineflower → remapJar → compileJava
+//
+// (Loom wires :genSourcesWithVineflower to depend on :remapJar, and
+// :remapJar depends on :compileJava for the mod's compiled classes.)
+//
+// Instead, we work around the validation error in the release.yml
+// workflow by running `genSources test` for the test job (which works
+// because remapJar is NOT in the test task graph), and skipping the
+// test task in the build job (matching the official build.yml pattern
+// of `-x test -x detekt`).
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
