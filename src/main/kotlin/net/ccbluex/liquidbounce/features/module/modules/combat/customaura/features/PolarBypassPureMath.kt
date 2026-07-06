@@ -50,6 +50,16 @@ object PolarBypassPureMath {
      * If the delta is already within the envelope, returns [target]
      * unchanged (this is important — callers use `result == target` to
      * detect whether the clamp engaged).
+     *
+     * The returned yaw is normalized to [-180, 180] via [wrapDegrees].
+     * Without this normalization, a current=170 / target=-170 input
+     * (which crosses the ±180 boundary) would produce a yaw of 185° —
+     * semantically correct (185° and -175° are the same direction)
+     * but inconsistent with the rest of the codebase, which assumes
+     * yaws are in [-180, 180]. Minecraft's network protocol would
+     * encode 185 and -175 to the same byte anyway, but keeping the
+     * internal representation canonical avoids surprising behavior in
+     * downstream consumers (rotation comparison, GCD computation, etc.).
      */
     fun clampDelta(
         current: Rotation,
@@ -60,7 +70,7 @@ object PolarBypassPureMath {
         val yawDiff = wrapDegrees(target.yaw - current.yaw)
         val pitchDiff = target.pitch - current.pitch
 
-        val clampedYaw = current.yaw + yawDiff.coerceIn(-maxYawDelta, maxYawDelta)
+        val clampedYaw = wrapDegrees(current.yaw + yawDiff.coerceIn(-maxYawDelta, maxYawDelta))
         val clampedPitch = current.pitch + pitchDiff.coerceIn(-maxPitchDelta, maxPitchDelta)
 
         return Rotation(clampedYaw, clampedPitch)
