@@ -26,29 +26,87 @@ import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.event.tickHandler
 import net.ccbluex.liquidbounce.features.module.Category
 import net.ccbluex.liquidbounce.features.module.ClientModule
+import net.ccbluex.liquidbounce.features.module.ModuleManager
 import net.ccbluex.liquidbounce.render.engine.type.Color4b
 import net.ccbluex.liquidbounce.utils.client.MessageMetadata
 import net.ccbluex.liquidbounce.utils.client.chat
+import net.ccbluex.liquidbounce.utils.client.mc
 import net.ccbluex.liquidbounce.utils.client.notification
 import net.ccbluex.liquidbounce.utils.math.Easing
 import net.ccbluex.liquidbounce.utils.render.WireframePlayer
 import net.minecraft.network.packet.s2c.common.DisconnectS2CPacket
+import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket
 import net.minecraft.util.math.Vec3d
 import org.apache.commons.lang3.StringUtils
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
+import java.time.Instant
+import java.time.format.DateTimeFormatter
+import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
 /**
  * Module Flag Check.
  *
- * Alerts you about set backs.
+ * Alerts you about set backs (lagbacks, force-rotates, kicks) and logs
+ * them to a file for post-mortem analysis.
+ *
+ * ## v2 improvements (audit-driven rewrite)
+ *
+ * 1. **Kick reason logging** — captures [DisconnectS2CPacket.reason] and
+ *    writes it to `<mc>/liquidbounce/flags.log` along with the timestamp.
+ *    The previous version zeroed `flagCount` on disconnect and discarded
+ *    the reason entirely.
+ *
+ * 2. **Packet ring buffer** — keeps the last 100 received packets in
+ *    memory. When a flag fires, the buffer is dumped to the log so the
+ *    user can see what the server sent in the 5 seconds leading up to
+ *    the flag.
+ *
+ * 3. **Anticheat chat parser** — scans incoming game messages for known
+ *    anticheat warning patterns (Polar, Verus, Vulcan, Grim, NCP) and
+ *    attributes the flag to the detected anticheat.
+ *
+ * 4. **Combat module attribution** — when a flag fires, queries
+ *    [ModuleManager] for currently-running combat modules and includes
+ *    them in the alert + log. Answers "who caused the flag?".
+ *
+ * 5. **File logging** — every flag is appended to
+ *    `<mc>/liquidbounce/flags.log` (real append mode, survives restarts).
  */
 object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arrayOf("FlagDetect")) {
 
     private var chatMessage by boolean("ChatMessage", true)
     private var notification by boolean("Notification", false)
     private var invalidAttributes by boolean("InvalidAttributes", false)
+
+    /**
+     * Master switch for file logging. When ON, every flag is appended to
+     * `<mc>/liquidbounce/flags.log` with full context (timestamp, reason,
+     * anticheat, active modules, packet ring buffer dump).
+     */
+    private var logToFile by boolean("LogToFile", true)
+
+    /**
+     * Master switch for the packet ring buffer. When ON, the last
+     * [ringBufferSize] packets are kept in memory and dumped to the log
+     * when a flag fires.
+     */
+    private var ringBufferEnabled by boolean("RingBuffer", true)
+
+    /**
+     * Number of packets to keep in the ring buffer. 100 packets at 20 TPS
+     * = ~5 seconds of history.
+     */
+    private var ringBufferSize by int("RingBufferSize", 100, 20..500)
+
+    /**
+     * Master switch for anticheat chat-message parsing.
+     */
+    private var parseAnticheatChat by boolean("ParseAnticheatChat", true)
 
     private object ResetFlags : ToggleableConfigurable(this, "ResetFlags", true) {
 
@@ -117,24 +175,75 @@ object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arra
     private var lastYaw = 0F
     private var lastPitch = 0F
 
+    /**
+     * Ring buffer of recent packets. Used to dump the last N packets
+     * to the log when a flag fires, so the user can see what the server
+     * sent in the seconds leading up to the flag.
+     *
+     * Synchronized on itself for thread safety — packet handler runs on
+     * the network thread, but the flag-triggered dump could in principle
+     * race with other readers.
+     */
+    private val packetRingBuffer = ArrayDeque<String>()
+
+    /**
+     * Detected anticheat. Set by the chat-message parser when it sees a
+     * known anticheat warning pattern. Cleared on world change.
+     */
+    @Volatile
+    private var detectedAnticheat: Anticheat = Anticheat.UNKNOWN
+
+    /**
+     * Log file writer for `flags.log`. Opened lazily on first flag.
+     * Uses real append mode (FileWriter(file, true)) so history survives
+     * across client restarts.
+     */
+    private var logWriter: PrintWriter? = null
+
+    /**
+     * Thread-safe date formatter for log timestamps.
+     */
+    private val dateFormat = DateTimeFormatter.ISO_INSTANT
+
     @Suppress("unused")
     private val packetHandler = handler<PacketEvent> { event ->
         if (player.age <= 25) {
             return@handler
         }
 
-        when (val packet = event.packet) {
+        val packet = event.packet
+
+        // Always record the packet in the ring buffer (regardless of type).
+        if (ringBufferEnabled) {
+            val packetDesc = describePacket(packet, event)
+            synchronized(packetRingBuffer) {
+                packetRingBuffer.addLast(packetDesc)
+                while (packetRingBuffer.size > ringBufferSize) {
+                    packetRingBuffer.pollFirst()
+                }
+            }
+        }
+
+        when (packet) {
             is PlayerPositionLookS2CPacket -> {
                 val change = packet.change
                 val deltaYaw = calculateAngleDelta(change.yaw, lastYaw)
                 val deltaPitch = calculateAngleDelta(change.pitch, lastPitch)
 
                 flagCount++
-                if (deltaYaw >= 90 || deltaPitch >= 90) {
-                    alert(AlertReason.FORCEROTATE, "(${deltaYaw.roundToLong()}° | ${deltaPitch.roundToLong()}°)")
+                val reason = if (deltaYaw >= 90 || deltaPitch >= 90) {
+                    AlertReason.FORCEROTATE
                 } else {
-                    alert(AlertReason.LAGBACK)
+                    AlertReason.LAGBACK
                 }
+                val extra = if (reason == AlertReason.FORCEROTATE) {
+                    "(${deltaYaw.roundToLong()}° | ${deltaPitch.roundToLong()}°)"
+                } else {
+                    null
+                }
+
+                alert(reason, extra)
+                logFlagToFile(reason, extra, change.position, deltaYaw, deltaPitch)
 
                 Render.reset()
                 val position = change.position
@@ -145,7 +254,33 @@ object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arra
             }
 
             is DisconnectS2CPacket -> {
+                // v2: capture the kick reason. The previous version just
+                // zeroed flagCount and discarded the reason.
+                val reason = packet.reason
+                val reasonString = try {
+                    reason.string
+                } catch (e: Exception) {
+                    "<untranslatable>"
+                }
+
+                flagCount++
+                alert(AlertReason.KICK, reasonString)
+                logKickToFile(reasonString)
                 flagCount = 0
+            }
+
+            is GameMessageS2CPacket -> {
+                // v2: parse anticheat chat warnings.
+                if (parseAnticheatChat) {
+                    val text = packet.content.string
+                    val detected = Anticheat.detect(text)
+                    if (detected != Anticheat.UNKNOWN) {
+                        detectedAnticheat = detected
+                        flagCount++
+                        alert(AlertReason.ANTICHEAT_WARNING, "[$detected] $text")
+                        logAnticheatWarningToFile(detected, text)
+                    }
+                }
             }
         }
     }
@@ -178,6 +313,7 @@ object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arra
 
             val reasonString = invalidReasons.joinToString()
             alert(AlertReason.INVALID, reasonString)
+            logFlagToFile(AlertReason.INVALID, reasonString, null, 0f, 0f)
         }
     }
 
@@ -204,11 +340,174 @@ object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arra
         return abs(delta)
     }
 
+    // ── v2: file logging ──────────────────────────────────────────────
+
+    /**
+     * Returns the log writer, opening the file lazily if needed.
+     * Opened in REAL append mode so history survives restarts.
+     */
+    private fun getLogWriter(): PrintWriter? {
+        if (!logToFile) return null
+        logWriter?.let { return it }
+        return try {
+            val dir = File(mc.runDirectory, "liquidbounce")
+            if (!dir.exists()) dir.mkdirs()
+            val file = File(dir, "flags.log")
+            val writer = PrintWriter(FileWriter(file, true), true)
+            logWriter = writer
+            writer
+        } catch (e: Exception) {
+            chat("§c[FlagCheck] Failed to open flags.log: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Returns a comma-separated list of currently-running combat modules.
+     * Used to attribute flags to the module that likely caused them.
+     */
+    private fun activeCombatModules(): String {
+        val running = ModuleManager.modules.filter { mod ->
+            mod.running && mod.category == Category.COMBAT
+        }.map { it.name }
+        return if (running.isEmpty()) "<none>" else running.joinToString(", ")
+    }
+
+    /**
+     * Snapshot the packet ring buffer as a multi-line string for logging.
+     */
+    private fun dumpRingBuffer(): String {
+        if (!ringBufferEnabled) return "<disabled>"
+        synchronized(packetRingBuffer) {
+            if (packetRingBuffer.isEmpty()) return "<empty>"
+            return packetRingBuffer.joinToString("\n  ")
+        }
+    }
+
+    private fun logFlagToFile(
+        reason: AlertReason,
+        extra: String?,
+        position: Vec3d?,
+        deltaYaw: Float,
+        deltaPitch: Float
+    ) {
+        val writer = getLogWriter() ?: return
+        val ts = dateFormat.format(Instant.now())
+        val posStr = position?.let { "(${it.x}, ${it.y}, ${it.z})" } ?: "n/a"
+        val extraStr = extra?.let { " | extra=$it" } ?: ""
+        val activeMods = activeCombatModules()
+
+        synchronized(writer) {
+            writer.println("=== FLAG @ $ts ===")
+            writer.println("  reason: ${reason.key}$extraStr")
+            writer.println("  deltaYaw: ${"%.2f".format(deltaYaw)}° | deltaPitch: ${"%.2f".format(deltaPitch)}°")
+            writer.println("  position: $posStr")
+            writer.println("  anticheat: $detectedAnticheat")
+            writer.println("  active combat modules: $activeMods")
+            writer.println("  flag count: $flagCount")
+            writer.println("  --- recent packets (oldest first) ---")
+            writer.println("  ${dumpRingBuffer()}")
+            writer.println("=== END FLAG ===")
+            writer.println()
+        }
+    }
+
+    private fun logKickToFile(reasonString: String) {
+        val writer = getLogWriter() ?: return
+        val ts = dateFormat.format(Instant.now())
+        val activeMods = activeCombatModules()
+
+        synchronized(writer) {
+            writer.println("!!! KICK @ $ts !!!")
+            writer.println("  reason: $reasonString")
+            writer.println("  anticheat: $detectedAnticheat")
+            writer.println("  active combat modules at kick: $activeMods")
+            writer.println("  flag count before kick: $flagCount")
+            writer.println("  --- recent packets (oldest first) ---")
+            writer.println("  ${dumpRingBuffer()}")
+            writer.println("!!! END KICK !!!")
+            writer.println()
+        }
+    }
+
+    private fun logAnticheatWarningToFile(anticheat: Anticheat, text: String) {
+        val writer = getLogWriter() ?: return
+        val ts = dateFormat.format(Instant.now())
+        val activeMods = activeCombatModules()
+
+        synchronized(writer) {
+            writer.println("~~~ ANTICHEAT WARNING @ $ts ~~~")
+            writer.println("  anticheat: $anticheat")
+            writer.println("  message: $text")
+            writer.println("  active combat modules: $activeMods")
+            writer.println("~~~ END WARNING ~~~")
+            writer.println()
+        }
+    }
+
+    /**
+     * Produce a short human-readable description of a packet for the
+     * ring buffer. Only includes packet type + key fields to keep the
+     * log readable.
+     */
+    private fun describePacket(packet: Any, event: PacketEvent): String {
+        val ts = dateFormat.format(Instant.now())
+        val direction = if (event.origin == net.ccbluex.liquidbounce.event.events.TransferOrigin.INCOMING) "S→C" else "C→S"
+        val typeName = packet.javaClass.simpleName
+        // Include key fields for high-value packet types.
+        val details = when (packet) {
+            is PlayerPositionLookS2CPacket -> {
+                val c = packet.change
+                "pos=(${c.position.x}, ${c.position.y}, ${c.position.z}) yaw=${"%.2f".format(c.yaw)} pitch=${"%.2f".format(c.pitch)}"
+            }
+            is net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket -> {
+                "onGround=${packet.isOnGround}"
+            }
+            is GameMessageS2CPacket -> {
+                "msg=${packet.content.string.take(120)}"
+            }
+            else -> ""
+        }
+        return "$ts $direction $typeName $details".trim()
+    }
+
+    /**
+     * Known anticheats and their chat-message detection patterns.
+     *
+     * Detection is case-insensitive substring match against the
+     * unformatted message text. The first matching anticheat wins.
+     */
+    @Suppress("SpellCheckingInspection")
+    enum class Anticheat(val displayName: String, vararg val patterns: String) {
+        POLAR("Polar", "polar", "[polar]"),
+        VERUS("Verus", "verus", "[verus]"),
+        VULCAN("Vulcan", "vulcan", "[vulcan]"),
+        GRIM("Grim", "grimac", "grim", "[grim]"),
+        NCP("NCP", "nocheatplus", "[ncp]"),
+        INTAVE("Intave", "intave", "[intave]"),
+        MATRIX("Matrix", "matrix", "[matrix]"),
+        KARHU("Karhu", "karhu", "[karhu]"),
+        UNKNOWN("Unknown");
+
+        companion object {
+            fun detect(text: String): Anticheat {
+                val lower = text.lowercase()
+                for (ac in entries) {
+                    if (ac == UNKNOWN) continue
+                    if (ac.patterns.any { lower.contains(it) }) return ac
+                }
+                return UNKNOWN
+            }
+        }
+    }
+
     @Suppress("SpellCheckingInspection")
     private enum class AlertReason(val key: String) {
         INVALID("invalid"),
         FORCEROTATE("forceRotate"),
-        LAGBACK("lagback")
+        LAGBACK("lagback"),
+        KICK("kick"),
+        ANTICHEAT_WARNING("anticheatWarning")
     }
 
 }

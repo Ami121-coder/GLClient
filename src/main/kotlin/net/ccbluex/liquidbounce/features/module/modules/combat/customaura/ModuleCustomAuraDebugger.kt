@@ -47,6 +47,7 @@ import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -145,7 +146,16 @@ object ModuleCustomAuraDebugger : ClientModule(
      */
     private val pbClampEvents = AtomicLong(0)
     private val pbTotalProcess = AtomicLong(0)
-    private var lastPbTargetYaw: Float? = null
+
+    /**
+     * Most recent PolarBypass yaw values, written by
+     * [recordPolarBypassProcess] and read by [recordEvent] so each
+     * AttackEvent captures the PolarBypass state at the moment of the
+     * attack. Both are @Volatile because they are written from the
+     * rotation thread and read from the tick thread.
+     */
+    @Volatile private var lastPbClampedYaw: Float? = null
+    @Volatile private var lastPbNoisedYaw: Float? = null
 
     /**
      * Log file writer. Lazily initialized when logToFile is true.
@@ -161,11 +171,15 @@ object ModuleCustomAuraDebugger : ClientModule(
     /**
      * Background flush scheduler. Runs on wall-clock time (not game ticks)
      * so logs are flushed even when the game is lagging or paused.
+     *
+     * The scheduled task is tracked in [flushFuture] so it can be
+     * cancelled on [disable] — otherwise repeated enable/disable
+     * cycles would leak tasks that keep trying to flush a closed writer.
      */
     private val flushExecutor = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "CustomAuraDebug-flusher").apply { isDaemon = true }
     }
-    private var flushScheduled = false
+    private var flushFuture: ScheduledFuture<*>? = null
 
     /**
      * Last event seen — used by the overlay to render the most recent
@@ -191,32 +205,35 @@ object ModuleCustomAuraDebugger : ClientModule(
         skipReasons.clear()
         pbClampEvents.set(0)
         pbTotalProcess.set(0)
-        lastPbTargetYaw = null
+        lastPbClampedYaw = null
+        lastPbNoisedYaw = null
         lastEvent = null
 
         if (logToFile) {
             openLogFile()
             // Schedule background flush on wall-clock time so logs are
-            // flushed even when the game is lagging.
-            if (!flushScheduled) {
-                flushExecutor.scheduleAtFixedRate(
-                    { flushLog(force = false) },
-                    flushIntervalMs.toLong(),
-                    flushIntervalMs.toLong(),
-                    TimeUnit.MILLISECONDS
-                )
-                flushScheduled = true
-            }
+            // flushed even when the game is lagging. Cancel any previous
+            // task first to avoid leaks across enable/disable cycles.
+            flushFuture?.cancel(false)
+            flushFuture = flushExecutor.scheduleAtFixedRate(
+                { flushLog(force = false) },
+                flushIntervalMs.toLong(),
+                flushIntervalMs.toLong(),
+                TimeUnit.MILLISECONDS
+            )
         }
     }
 
     override fun disable() {
         super.disable()
+        // Cancel the background flush task BEFORE flushing+closing the
+        // writer, so the task doesn't race with writer.close().
+        flushFuture?.cancel(false)
+        flushFuture = null
         flushLog(force = true)
         logWriter?.close()
         logWriter = null
         logFile = null
-        flushScheduled = false
     }
 
     /**
@@ -261,8 +278,11 @@ object ModuleCustomAuraDebugger : ClientModule(
             yaw = player.rotation.yaw,
             pitch = player.rotation.pitch,
             serverYaw = RotationManager.serverRotation.yaw,
-            pbClampedYaw = null,  // set by PolarBypass monitor
-            pbNoisedYaw = null
+            // Snapshot the latest PolarBypass yaw values. These are written
+            // by recordPolarBypassProcess() on the rotation thread and read
+            // here on the tick thread — @Volatile ensures visibility.
+            pbClampedYaw = lastPbClampedYaw,
+            pbNoisedYaw = lastPbNoisedYaw
         )
 
         // Update statistics.
@@ -294,19 +314,33 @@ object ModuleCustomAuraDebugger : ClientModule(
     }
 
     /**
-     * Public API called by CustomAuraPolarBypass to track clamp events.
+     * Public API called by CustomAuraPolarBypass to track clamp events
+     * and snapshot the latest clamped/noised yaw values.
+     *
      * If the yaw delta between current and target exceeded maxYawDelta,
      * the clamp engaged — that's normal, but if it fires too often it
      * means the base AngleSmooth is too aggressive.
+     *
+     * The [clampedYaw] and [noisedYaw] values are stored in volatile
+     * fields so the next [recordEvent] call can snapshot them into the
+     * AttackEvent, giving us per-attack PolarBypass state in the log
+     * and overlay.
      */
-    fun recordPolarBypassProcess(currentYaw: Float, targetYaw: Float, clamped: Boolean) {
+    fun recordPolarBypassProcess(
+        currentYaw: Float,
+        targetYaw: Float,
+        clamped: Boolean,
+        clampedYaw: Float,
+        noisedYaw: Float
+    ) {
         if (!running || !monitorPolarBypass) return
 
         pbTotalProcess.incrementAndGet()
         if (clamped) {
             pbClampEvents.incrementAndGet()
         }
-        lastPbTargetYaw = targetYaw
+        lastPbClampedYaw = clampedYaw
+        lastPbNoisedYaw = noisedYaw
     }
 
     @Suppress("unused")
@@ -372,6 +406,8 @@ object ModuleCustomAuraDebugger : ClientModule(
             add("")
             add("§7Yaw: §f${"%.2f".format(last.yaw ?: 0f)}")
             add("§7Server yaw: §f${"%.2f".format(last.serverYaw ?: 0f)}")
+            last.pbClampedYaw?.let { add("§7PB clamped: §f${"%.2f".format(it)}") }
+            last.pbNoisedYaw?.let { add("§7PB noised: §f${"%.2f".format(it)}") }
             if (monitorPolarBypass && pbTotalProcess.get() > 0) {
                 val ratio = pbClampEvents.get() * 100 / pbTotalProcess.get()
                 add("§7PB clamp: §f${pbClampEvents.get()}/${pbTotalProcess.get()} ($ratio%)")
@@ -445,6 +481,8 @@ object ModuleCustomAuraDebugger : ClientModule(
             event.validateAttack?.let { append(" | validate=").append(it) }
             event.yaw?.let { append(" | yaw=").append("%.2f".format(it)) }
             event.serverYaw?.let { append(" | serverYaw=").append("%.2f".format(it)) }
+            event.pbClampedYaw?.let { append(" | pbClampedYaw=").append("%.2f".format(it)) }
+            event.pbNoisedYaw?.let { append(" | pbNoisedYaw=").append("%.2f".format(it)) }
         }
         // synchronized on logWriter because PrintWriter is not thread-safe
         // and recordEvent may be called from multiple threads.

@@ -152,8 +152,16 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         lastEmittedRotation = noised
 
         // Report clamp event to the debugger for health monitoring.
+        // Also snapshot the clamped/noised yaw so the next AttackEvent
+        // captures the PolarBypass state at the moment of the attack.
         net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAuraDebugger
-            .recordPolarBypassProcess(currentRotation.yaw, targetRotation.yaw, clampedEngaged)
+            .recordPolarBypassProcess(
+                currentYaw = currentRotation.yaw,
+                targetYaw = targetRotation.yaw,
+                clamped = clampedEngaged,
+                clampedYaw = clamped.yaw,
+                noisedYaw = noised.yaw
+            )
 
         // ── DEBUG: PolarBypass process diagnostics ──────────────────
         net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
