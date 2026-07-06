@@ -130,10 +130,13 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
             // Drain from the front: timestamps are appended in
             // monotonically increasing order, so once we hit one that's
             // still within the window we can stop.
+            // Note: kotlin.collections.ArrayDeque doesn't have Java Deque's
+            // peekFirst()/pollFirst() — use firstOrNull()/removeFirstOrNull()
+            // instead, which return null on an empty deque.
             while (recentAttackTimestamps.isNotEmpty()) {
-                val oldest = recentAttackTimestamps.peekFirst() ?: break
+                val oldest = recentAttackTimestamps.firstOrNull() ?: break
                 if (oldest < cutoff) {
-                    recentAttackTimestamps.pollFirst()
+                    recentAttackTimestamps.removeFirst()
                 } else {
                     break
                 }
@@ -153,9 +156,9 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
             // without [appendAttackTimestamp] (e.g. score() on tick
             // handler while no new attacks arrive).
             while (recentAttackTimestamps.isNotEmpty()) {
-                val oldest = recentAttackTimestamps.peekFirst() ?: break
+                val oldest = recentAttackTimestamps.firstOrNull() ?: break
                 if (oldest < cutoff) {
-                    recentAttackTimestamps.pollFirst()
+                    recentAttackTimestamps.removeFirst()
                 } else {
                     break
                 }
