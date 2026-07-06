@@ -113,25 +113,12 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
     private val tickCounter: Long
         get() = player.age.toLong()
 
-    /**
-     * Tracks the last rotation we emitted so we can clamp the next
-     * delta to the per-tick maximum.
-     *
-     * Access is confined to the rotation processing thread (the
-     * processor pipeline runs synchronously on the rotation update),
-     * so no synchronization is needed. The [GameTickEvent] handler
-     * that clears this field also runs on the main client thread,
-     * which is the same thread that fires rotation updates.
-     */
-    private var lastEmittedRotation: Rotation? = null
-
     @Suppress("unused")
     private val tickHandler = handler<GameTickEvent> {
-        // Reset last emitted rotation when there is no active target
-        // so the next aim sequence starts from a fresh baseline.
-        if (ModuleCustomAura.targetTracker.target == null) {
-            lastEmittedRotation = null
-        }
+        // No per-tick state to reset — the previous [lastEmittedRotation]
+        // field was dead code (written but never read; [clampDelta] uses
+        // the [current] parameter passed by the processor pipeline, not
+        // any cached value). It has been removed.
     }
 
     override fun process(
@@ -146,7 +133,7 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         // limited to: reading player.age for the time axis, using the live
         // Random for noise, and reporting results to the debugger/overlay.
         val tickSeconds = tickCounter * TICK_SECONDS
-        val (noised, clampedEngaged) = PolarBypassPureMath.process(
+        val result = PolarBypassPureMath.process(
             current = currentRotation,
             target = targetRotation,
             tickSeconds = tickSeconds,
@@ -158,46 +145,34 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
             random = Random
         )
 
-        // Reconstruct the clamped rotation for the debugger snapshot.
-        // (PolarBypassPureMath.process returns only the final noised value,
-        // so we recompute the clamped value here. This is cheap.)
-        val clamped = PolarBypassPureMath.clampDelta(
-            currentRotation, targetRotation, maxYawDelta, maxPitchDelta
-        )
-
-        // Step 4: remember the emitted value for the next tick's clamp.
-        lastEmittedRotation = noised
-
         // Report clamp event to the debugger for health monitoring.
         // Also snapshot the clamped/noised yaw so the next AttackEvent
         // captures the PolarBypass state at the moment of the attack.
+        //
+        // The previous implementation called [PolarBypassPureMath.clampDelta]
+        // a SECOND time here just to recover the clamped value for the
+        // debugger — that was wasted work on every rotation update. The
+        // new [ProcessResult] carries [PolarBypassPureMath.ProcessResult.clamped]
+        // so we get it for free.
         ModuleCustomAuraDebugger.recordPolarBypassProcess(
             currentYaw = currentRotation.yaw,
             targetYaw = targetRotation.yaw,
-            clamped = clampedEngaged,
-            clampedYaw = clamped.yaw,
-            noisedYaw = noised.yaw
+            clamped = result.clampEngaged,
+            clampedYaw = result.clamped.yaw,
+            noisedYaw = result.final.yaw
         )
 
         // ── DEBUG: PolarBypass process diagnostics ──────────────────
-        // Use the lazy inline extension so the lambdas are only invoked
-        // when ModuleDebug is actually running — the previous eager form
-        // paid the (cheap but unnecessary) property-read cost on every
-        // rotation update even with the debugger disabled.
         this.debugParameter("PB_CurrentYaw") { currentRotation.yaw }
         this.debugParameter("PB_TargetYaw") { targetRotation.yaw }
-        this.debugParameter("PB_ClampedYaw") { clamped.yaw }
-        // Note: 'PB_DriftedYaw' was removed — PolarBypassPureMath.process
-        // returns only the final noised value. The clamped→drifted→noised
-        // pipeline is tested in PolarBypassPureMathTest; here we only
-        // expose the inputs (current/target) and outputs (clamped/noised).
-        this.debugParameter("PB_NoisedYaw") { noised.yaw }
-        this.debugParameter("PB_NoisedPitch") { noised.pitch }
+        this.debugParameter("PB_ClampedYaw") { result.clamped.yaw }
+        this.debugParameter("PB_NoisedYaw") { result.final.yaw }
+        this.debugParameter("PB_NoisedPitch") { result.final.pitch }
         this.debugParameter("PB_MaxYawDelta") { maxYawDelta }
         this.debugParameter("PB_NoiseStddev") { noiseStddev }
         this.debugParameter("PB_DriftAmp") { driftAmplitude }
 
-        return noised
+        return result.final
     }
 
     /**

@@ -68,10 +68,6 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
     /**
      * Public entry — called by the main module when the aura has a target
      * but cannot land a hit on it this tick.
-     *
-     * Renamed from [dealWithFakeSwing] for clarity — the old name was
-     * too colloquial. The old name is kept as a deprecated alias so
-     * existing call sites continue to compile during the rename rollout.
      */
     suspend fun performFailSwing(sequence: Sequence, target: Entity?) {
         if (!enabled || !ModuleCustomAura.validateAttack()) return
@@ -104,10 +100,6 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
         }
     }
 
-    /** @deprecated Use [performFailSwing]. */
-    suspend fun dealWithFakeSwing(sequence: Sequence, target: Entity?) =
-        performFailSwing(sequence, target)
-
     /**
      * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
      */
@@ -115,5 +107,11 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
         this.enabled = params.failSwingEnabled
         additionalRange = params.failSwingAdditionalRangeStart..params.failSwingAdditionalRangeEnd
         minIntervalMs = params.failSwingMinIntervalMs
+        // Re-roll the per-tick additional range so the new preset's
+        // range is reflected immediately. The previous implementation
+        // left [currentAdditionalRange] holding the OLD preset's value
+        // until the next AttackEntityEvent fired, which meant the first
+        // few fail-swings after a preset switch used the wrong range.
+        currentAdditionalRange = additionalRange.random()
     }
 }

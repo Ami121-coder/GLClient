@@ -132,19 +132,11 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     /**
      * Set the visual block animation state without sending any packet.
      * Safe to call every tick.
-     *
-     * Renamed from [makeSeemBlock] for clarity — the previous name was
-     * too colloquial. The old name is kept as a deprecated alias so
-     * existing call sites in [ModuleCustomAura] and [CustomAuraFailSwing]
-     * continue to compile during the rename rollout.
      */
     fun setVisualBlockState() {
         if (!enabled) return
         blockVisual = true
     }
-
-    /** @deprecated Use [setVisualBlockState]. */
-    fun makeSeemBlock() = setVisualBlockState()
 
     /**
      * Start blocking. Sends AT MOST ONE interactItem packet per block
@@ -152,9 +144,7 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
      *
      * Debug diagnostics for the skip-reason tree are coalesced into a
      * single [emitStartBlockingDebug] helper so the main control flow
-     * reads cleanly without a forest of `debugParameter` calls. The
-     * helper uses the lazy inline extension so the lambdas are only
-     * evaluated when the debugger is actually running.
+     * reads cleanly without a forest of `debugParameter` calls.
      */
     fun startBlocking() {
         // Always emit the entry-state diagnostics — these are cheap and
@@ -168,6 +158,14 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
 
         if (blockMode == BlockMode.FAKE) {
             blockVisual = true
+            // NOTE: do NOT set [blockingStateEnforced] in FAKE mode —
+            // FAKE mode never sends a packet, so the server never
+            // considers us blocking. The previous implementation
+            // correctly skipped the packet but also skipped clearing
+            // [blockingStateEnforced] when the user later switched
+            // from BASIC to FAKE, leaving a stale `true` that caused
+            // [stopBlocking] to no-op on the next attempt.
+            blockingStateEnforced = false
             this.debugParameter("AB_SkipReason") { "fake_mode_visual_only" }
             return
         }
@@ -200,9 +198,16 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
             player.swingHand(blockHand)
         }
 
-        blockVisual = true
-        blockingStateEnforced = true
-        this.debugParameter("AB_StartedBlocking") { true }
+        // Only set [blockingStateEnforced] if the server actually
+        // accepted the interactItem. The previous implementation set
+        // it unconditionally, which meant a rejected interactItem (e.g.
+        // item disabled by server, region protection) would leave the
+        // flag `true` and cause future [startBlocking] calls to no-op
+        // (because the `player.isBlockAction && BASIC` early-return
+        // would not fire — the server never put us in block state).
+        blockingStateEnforced = actionResult.isAccepted
+        blockVisual = actionResult.isAccepted
+        this.debugParameter("AB_StartedBlocking") { actionResult.isAccepted }
     }
 
     /**
@@ -222,14 +227,30 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     /**
      * Stop blocking. Vanilla stopUsingItem only — no slot toggling.
      * Returns true if we actually unblocked (i.e. we were blocking before).
+     *
+     * The [blockingStateEnforced] flag is ALWAYS cleared when we attempt
+     * to stop, even if [player.isBlockAction] is already false (which
+     * happens when the server itself dropped the block — e.g. shield
+     * broke, item swapped). The previous implementation returned early
+     * in that case WITHOUT clearing the flag, leaving a stale `true`
+     * that caused future [startBlocking] calls to no-op.
      */
     fun stopBlocking(pauses: Boolean = false): Boolean {
         if (!pauses) {
             blockVisual = false
-            if (mc.options.useKey.isPressedOnAny) return false
+            if (mc.options.useKey.isPressedOnAny) {
+                blockingStateEnforced = false
+                return false
+            }
         }
 
-        if (!player.isBlockAction) return false
+        if (!player.isBlockAction) {
+            // Server already dropped the block (or never accepted our
+            // interactItem). Clear the enforced flag so the next
+            // [startBlocking] can actually send a fresh interactItem.
+            blockingStateEnforced = false
+            return false
+        }
 
         currentTickOff = tickOffRange.random()
 
@@ -239,6 +260,9 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
             return true
         }
 
+        // UnblockMode.NONE — don't send a packet, but still clear the
+        // enforced flag so we don't get stuck thinking we're blocking.
+        blockingStateEnforced = false
         return false
     }
 
@@ -254,6 +278,16 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
         unblockMode = params.unblockMode
         tickOffRange = params.tickOffStart..params.tickOffEnd
         tickOnRange = params.tickOnStart..params.tickOnEnd
+        // Re-roll [currentTickOff] / [currentTickOn] so the new preset's
+        // tick ranges take effect on the very next block/unblock cycle.
+        // The previous implementation left them holding the OLD preset's
+        // value until the next onChanged fired.
+        currentTickOff = tickOffRange.random()
+        currentTickOn = tickOnRange.random()
+        // Clear the enforced flag so a preset switch doesn't leave us
+        // thinking we're blocking when we're not.
+        blockingStateEnforced = false
+        blockVisual = false
     }
 
     enum class BlockMode(override val choiceName: String) : NamedChoice {

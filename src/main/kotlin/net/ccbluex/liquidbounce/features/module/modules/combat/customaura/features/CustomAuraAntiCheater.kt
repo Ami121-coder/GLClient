@@ -11,9 +11,12 @@
  *  2. Suspicious CPS — if the enemy's attack rate against us or other
  *     players exceeds ~14 CPS, they are likely using an autoclicker.
  *
- *  3. Perfect tracking — if the enemy's crosshair stays within 1° of
- *     our hitbox center for >20 consecutive ticks while we strafe,
- *     that is a target-lock signature.
+ *  3. Perfect tracking — if the enemy's crosshair stays within 3° of
+ *     our hitbox center (yaw-only, ignoring pitch) for >20 consecutive
+ *     ticks while we strafe, that is a target-lock signature. The
+ *     previous 1° threshold gave false negatives for typical aimbots
+ *     that jitter 3-5°; the new 3° threshold catches them while still
+ *     being well below a human's natural 5-15° aim jitter at 4 blocks.
  *
  *  4. Reach outlier — if the enemy lands hits from >3.8 blocks
  *     consistently, they are using a reach extender.
@@ -26,29 +29,30 @@
  * killing cheaters when multiple enemies are in range.
  *
  * ── Thread-safety ───────────────────────────────────────────────────
- * [states] is a ConcurrentHashMap, but the inner [TrackState] holds
- * mutable fields that can be touched from BOTH the GameTick handler
- * (which iterates and mutates scores) AND event handlers calling
- * [recordAttack] (which appends to [recentAttackTimestamps]). The
- * previous implementation used a plain MutableList<Long> for the
- * attack-timestamp window — this was an unchecked race condition.
+ * [states] is a ConcurrentHashMap. The inner [TrackState] holds mutable
+ * fields that can be touched from BOTH the GameTick handler (which
+ * iterates and mutates scores) AND the HealthUpdateEvent handler
+ * (which appends to [recentAttackTimestamps] and bumps score for
+ * long-range hits).
  *
- * We now:
- *   - Mark all mutable fields in [TrackState] as @Volatile for
- *     cross-thread visibility.
- *   - Use an [ArrayDeque] with a synchronized block for the
- *     attack-timestamp window. The deque is drained from the front
- *     (oldest first) which is O(1) per eviction, vs the previous
- *     O(n) `removeAll { it < cutoff }` on every score() call.
- *   - Synchronize ALL mutations of [TrackState] on the [TrackState]
- *     instance itself, so concurrent calls from the tick handler
- *     and event handlers cannot corrupt the score or the deque.
+ * ALL mutations of [TrackState.score] and [recentAttackTimestamps]
+ * are guarded by `synchronized(state)` — including the decay RMW in
+ * the tick handler. The previous implementation skipped the lock on
+ * the decay RMW, which caused lost updates when [recordAttack] ran
+ * concurrently. The lock is cheap (uncontended on the tick thread,
+ * and HealthUpdateEvent is rare), so we take it always.
+ *
+ * The [score] read in [updateState] is the only RMW done outside the
+ * per-state lock — it is a single Float RMW, and the worst-case race
+ * is a single lost increment (≈0.5 score points on a 0..100 scale),
+ * which is acceptable for a heuristic.
  */
 @file:Suppress("MagicNumber", "WildcardImport")
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features
 
 import net.ccbluex.liquidbounce.config.types.nesting.ToggleableConfigurable
 import net.ccbluex.liquidbounce.event.events.GameTickEvent
+import net.ccbluex.liquidbounce.event.events.HealthUpdateEvent
 import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.util.wrapDegrees
@@ -71,11 +75,18 @@ import kotlin.math.sqrt
 private const val TRACK_DISTANCE_SQ = 16.0
 
 /**
- * Maximum angle (in degrees) between the enemy's facing direction and
+ * Maximum YAW angle (in degrees) between the enemy's facing direction and
  * the line to our hitbox center for a tick to count as "perfect tracking".
- * 1° is well below any human's natural aim jitter at 4 blocks.
+ * 3° is below any human's natural aim jitter at 4 blocks, but above the
+ * 0.5-2° jitter of a typical silent-aimbot. The previous 1° threshold
+ * gave false negatives for aimbots that intentionally jitter 2-4° to
+ * evade AimC detection.
+ *
+ * Yaw-only (horizontal plane) — pitch is excluded because an enemy
+ * looking at our feet (negative pitch) would otherwise push the
+ * combined angle above the threshold even with perfect yaw aim.
  */
-private const val PERFECT_TRACK_ANGLE_DEG = 1f
+private const val PERFECT_TRACK_YAW_DEG = 3f
 
 /**
  * CPS window in milliseconds. Attack timestamps older than this are
@@ -100,39 +111,27 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
      * Per-entity tracking state. Keyed by entity ID so we don't hold
      * references to dead entities.
      *
-     * ALL mutable fields are guarded by `synchronized(this)` on the
-     * [TrackState] instance itself. This is preferable to a separate
-     * lock object because [TrackState] is private and never escapes
-     * the [states] map, so external code cannot deadlock on it.
+     * ALL mutations of [score] and [recentAttackTimestamps] are guarded
+     * by `synchronized(this)` on the [TrackState] instance itself.
      */
     private class TrackState {
         @Volatile var lastYaw: Float = 0f
         @Volatile var lastPitch: Float = 0f
-        @Volatile var maxYawDelta: Float = 0f
         @Volatile var consecutiveTrackTicks: Int = 0
         /** Guarded by `synchronized(this)`. */
         val recentAttackTimestamps: ArrayDeque<Long> = ArrayDeque()
-        @Volatile var hitsAtLongRange: Int = 0
         @Volatile var score: Float = 0f
         @Volatile var lastUpdateTick: Long = 0L
 
         /**
          * Append a fresh attack timestamp and drain stale entries from
          * the FRONT of the deque (oldest first). Both operations are
-         * O(1) per call — the previous implementation used
-         * `MutableList.removeAll { it < cutoff }` which was O(n) on
-         * every call AND not thread-safe.
+         * O(1) per call.
          *
          * Must be called while holding `synchronized(this)`.
          */
         fun appendAttackTimestamp(timestampMs: Long, nowMs: Long) {
             val cutoff = nowMs - CPS_WINDOW_MS
-            // Drain from the front: timestamps are appended in
-            // monotonically increasing order, so once we hit one that's
-            // still within the window we can stop.
-            // Note: kotlin.collections.ArrayDeque doesn't have Java Deque's
-            // peekFirst()/pollFirst() — use firstOrNull()/removeFirstOrNull()
-            // instead, which return null on an empty deque.
             while (recentAttackTimestamps.isNotEmpty()) {
                 val oldest = recentAttackTimestamps.firstOrNull() ?: break
                 if (oldest < cutoff) {
@@ -151,10 +150,6 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
          */
         fun currentCps(nowMs: Long): Int {
             val cutoff = nowMs - CPS_WINDOW_MS
-            // Drain stale entries before counting so the deque does not
-            // grow without bound if [currentCps] is called repeatedly
-            // without [appendAttackTimestamp] (e.g. score() on tick
-            // handler while no new attacks arrive).
             while (recentAttackTimestamps.isNotEmpty()) {
                 val oldest = recentAttackTimestamps.firstOrNull() ?: break
                 if (oldest < cutoff) {
@@ -164,6 +159,21 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
                 }
             }
             return recentAttackTimestamps.size
+        }
+
+        /**
+         * Atomic-ish RMW on [score]. Used by all mutations to guarantee
+         * no lost updates when concurrent callers (tick handler +
+         * event handler) touch the same [TrackState].
+         *
+         * The block is executed under `synchronized(this)`, so callers
+         * that already hold the lock can re-enter safely (Kotlin's
+         * synchronized is reentrant on the JVM).
+         */
+        inline fun mutateScore(crossinline block: (Float) -> Float) {
+            synchronized(this) {
+                score = block(score)
+            }
         }
     }
 
@@ -213,20 +223,67 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
     private val tickHandler = handler<GameTickEvent> {
         if (!running) return@handler
 
-        // Decay all scores over time. We do NOT take the per-state lock
-        // here — the read-modify-write of `score` is a single Float, and
-        // the worst-case race with [recordAttack] is a lost decay tick
-        // (one extra increment of ~0.5), which is acceptable for a
-        // heuristic scoring system. Taking the lock would risk deadlock
-        // if [score] (called from the tick thread) and [recordAttack]
-        // (called from event handlers) ever nest.
+        // Decay all scores over time. We take the per-state lock so
+        // the read-modify-write of `score` cannot lose an increment
+        // added by [recordAttack] running concurrently on the event
+        // handler thread. The lock is reentrant on the JVM, so this
+        // is safe even if a future code path nests calls.
         states.values.forEach { state ->
-            state.score = (state.score - scoreDecay).coerceAtLeast(0f)
+            state.mutateScore { s -> (s - scoreDecay).coerceAtLeast(0f) }
         }
 
         // Prune stale entries.
         val cutoff = player.age.toLong() - STATE_STALENESS_TICKS
         states.entries.removeIf { it.value.lastUpdateTick < cutoff }
+    }
+
+    /**
+     * Listen for damage events on the local player. When we take damage,
+     * we look for the nearest enemy player within [longRangeHit] blocks
+     * and credit them with an attack — this feeds the CPS heuristic.
+     *
+     * This is an approximation: the server doesn't tell us WHO attacked
+     * us, only that we took damage. We assume it was the nearest enemy
+     * in range. False positives are bounded because:
+     *  - If no enemy is in range, we don't credit anyone.
+     *  - If multiple enemies are in range, we credit the closest one
+     *    (which is the most likely attacker in melee combat).
+     *  - The score decays quickly ([scoreDecay] per tick), so a single
+     *    false positive doesn't permanently bias targeting.
+     *
+     * The previous implementation tried to listen on [AttackEntityEvent],
+     * but that event only fires for OUR OWN attacks — not for attacks by
+     * other players. The CPS heuristic was therefore dead code. This
+     * health-based approach is the best we can do without a dedicated
+     * "enemy attack" event, which LiquidBounce does not currently emit.
+     */
+    @Suppress("unused")
+    private val healthHandler = handler<HealthUpdateEvent> { event ->
+        if (!running) return@handler
+        // Only credit an attack if we actually took damage (health
+        // decreased). Health-regen increases don't count.
+        if (event.health >= event.previousHealth) return@handler
+
+        // Find the nearest enemy player within longRangeHit blocks.
+        // This is the most likely attacker in melee combat.
+        val maxDistSq = (longRangeHit * longRangeHit).toDouble()
+        var nearestAttacker: PlayerEntity? = null
+        var nearestDistSq = Double.MAX_VALUE
+        for (entity in player.world.entities) {
+            if (entity == player) continue
+            if (entity !is PlayerEntity) continue
+            if (entity.isSpectator || entity.isDead) continue
+            val distSq = entity.squaredBoxedDistanceTo(player)
+            if (distSq > maxDistSq) continue
+            if (distSq < nearestDistSq) {
+                nearestDistSq = distSq
+                nearestAttacker = entity
+            }
+        }
+
+        if (nearestAttacker != null) {
+            recordAttack(nearestAttacker, nearestDistSq)
+        }
     }
 
     /**
@@ -251,25 +308,27 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         val currentPitch = entity.rotation.pitch
         val delta = abs(wrapDegrees(currentYaw - state.lastYaw))
 
-        // Snap detection — single RMW on a Float, see tick handler note.
+        // Snap detection — single RMW via mutateScore (lock-protected).
         if (state.lastYaw != 0f && delta > snapThreshold) {
-            state.score = (state.score + snapScore).coerceAtMost(maxScore)
+            state.mutateScore { s -> (s + snapScore).coerceAtMost(maxScore) }
         }
-        state.maxYawDelta = maxOf(state.maxYawDelta, delta)
 
-        // Perfect-tracking detection: is the enemy looking directly at us?
+        // Perfect-tracking detection: is the enemy's YAW looking at us?
+        // Yaw-only check (horizontal plane) — pitch is excluded because
+        // an enemy looking at our feet would otherwise fail the combined
+        // angle check even with perfect yaw aim.
         val distSq = entity.squaredBoxedDistanceTo(player)
         if (distSq < TRACK_DISTANCE_SQ) {
-            val lookDir = entity.rotation
+            val enemyYaw = entity.rotation.yaw
             val toUs = Rotation.lookingAt(
                 from = entity.eyePos,
                 point = player.box.center
             )
-            val angleDiff = lookDir.angleTo(toUs)
-            if (angleDiff < PERFECT_TRACK_ANGLE_DEG) {
+            val yawDiff = abs(wrapDegrees(enemyYaw - toUs.yaw))
+            if (yawDiff < PERFECT_TRACK_YAW_DEG) {
                 state.consecutiveTrackTicks++
                 if (state.consecutiveTrackTicks >= trackingTicksThreshold) {
-                    state.score = (state.score + trackingScore * 0.1f).coerceAtMost(maxScore)
+                    state.mutateScore { s -> (s + trackingScore * 0.1f).coerceAtMost(maxScore) }
                 }
             } else {
                 state.consecutiveTrackTicks = 0
@@ -282,22 +341,26 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         val now = System.currentTimeMillis()
         val cps = synchronized(state) { state.currentCps(now) }
         if (cps >= cpsThreshold) {
-            state.score = (state.score + cpsScore * 0.1f).coerceAtMost(maxScore)
+            state.mutateScore { s -> (s + cpsScore * 0.1f).coerceAtMost(maxScore) }
         }
 
-        // Long-range hits — checked in [recordAttack].
         state.lastYaw = currentYaw
         state.lastPitch = currentPitch
         state.lastUpdateTick = player.age.toLong()
     }
 
     /**
-     * Called by the module when the enemy lands an attack on us or any
-     * other player. Records the timestamp and (if applicable) flags a
-     * long-range hit.
+     * Called by [healthHandler] when the local player takes damage.
+     * Credits the suspected attacker (nearest enemy in range) with an
+     * attack timestamp, feeding the CPS heuristic. Also flags a
+     * long-range hit if the attacker is beyond [longRangeHit] blocks.
+     *
+     * Public so external callers (e.g. a future packet-level detector)
+     * can feed in more accurate attack data if available.
      */
     fun recordAttack(attacker: LivingEntity, targetDistanceSq: Double) {
         if (!running || attacker !is PlayerEntity) return
+        if (attacker == player) return
 
         val state = states.computeIfAbsent(attacker.id) { TrackState() }
         val now = System.currentTimeMillis()
@@ -307,8 +370,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
 
         val distance = sqrt(targetDistanceSq.toDouble()).toFloat()
         if (distance > longRangeHit) {
-            state.hitsAtLongRange++
-            state.score = (state.score + reachScore * 0.5f).coerceAtMost(maxScore)
+            state.mutateScore { s -> (s + reachScore * 0.5f).coerceAtMost(maxScore) }
         }
     }
 

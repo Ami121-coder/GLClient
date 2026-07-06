@@ -21,6 +21,29 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
+ * Hard cap on pitch. Vanilla Minecraft clamps player pitch to [-90, 90].
+ * If our drift+noise pipeline pushes pitch outside this range, the server
+ * will silently clamp it — but the rotation we used for raytracing on
+ * the client side would not match, causing us to "miss" the target
+ * without any visible reason. We pre-clamp here so client and server
+ * agree.
+ */
+private const val PITCH_HARD_MIN = -90f
+private const val PITCH_HARD_MAX = 90f
+
+/**
+ * Minimum value for the u1 uniform in Box-Muller. The previous value
+ * `Float.MIN_VALUE` (≈1.4e-45) made `ln(u1) ≈ -103`, which produced
+ * occasional 14.4σ spikes when `nextFloat()` returned exactly 0.0
+ * (probability ~2^-24). At `noiseStddev = 0.05°`, that's a 0.72°
+ * instantaneous jump — easily detectable by Polar AimB as a GCD
+ * anomaly. We now floor u1 at 1e-7, which limits the worst-case spike
+ * to ~5.4σ (0.27° at 0.05° stddev) — still rare, but below the AimB
+ * detection threshold.
+ */
+private const val GAUSSIAN_U1_FLOOR = 1e-7f
+
+/**
  * Pure math for the PolarBypass rotation processor.
  *
  * Every function is deterministic given its inputs (except [gaussianNoise],
@@ -52,14 +75,11 @@ object PolarBypassPureMath {
      * detect whether the clamp engaged).
      *
      * The returned yaw is normalized to [-180, 180] via [wrapDegrees].
-     * Without this normalization, a current=170 / target=-170 input
-     * (which crosses the ±180 boundary) would produce a yaw of 185° —
-     * semantically correct (185° and -175° are the same direction)
-     * but inconsistent with the rest of the codebase, which assumes
-     * yaws are in [-180, 180]. Minecraft's network protocol would
-     * encode 185 and -175 to the same byte anyway, but keeping the
-     * internal representation canonical avoids surprising behavior in
-     * downstream consumers (rotation comparison, GCD computation, etc.).
+     * The returned pitch is clamped to [-90, 90] to match vanilla
+     * Minecraft's pitch range — without this, drift+noise could push
+     * pitch outside the vanilla range and cause client/server
+     * disagreement (the server silently clamps, the client doesn't,
+     * raytraces diverge, attacks "miss" for no visible reason).
      */
     fun clampDelta(
         current: Rotation,
@@ -71,7 +91,8 @@ object PolarBypassPureMath {
         val pitchDiff = target.pitch - current.pitch
 
         val clampedYaw = wrapDegrees(current.yaw + yawDiff.coerceIn(-maxYawDelta, maxYawDelta))
-        val clampedPitch = current.pitch + pitchDiff.coerceIn(-maxPitchDelta, maxPitchDelta)
+        val clampedPitch = (current.pitch + pitchDiff.coerceIn(-maxPitchDelta, maxPitchDelta))
+            .coerceIn(PITCH_HARD_MIN, PITCH_HARD_MAX)
 
         return Rotation(clampedYaw, clampedPitch)
     }
@@ -119,7 +140,9 @@ object PolarBypassPureMath {
         val yawDrift = amplitude * cos(omega * tickSeconds)
         val pitchDrift = amplitude * 0.6f * sin(omega * 1.3f * tickSeconds)
 
-        return Rotation(rotation.yaw + yawDrift, rotation.pitch + pitchDrift)
+        // Clamp pitch after drift so we never exceed vanilla [-90, 90].
+        val newPitch = (rotation.pitch + pitchDrift).coerceIn(PITCH_HARD_MIN, PITCH_HARD_MAX)
+        return Rotation(rotation.yaw + yawDrift, newPitch)
     }
 
     /**
@@ -141,18 +164,26 @@ object PolarBypassPureMath {
         val yawNoise = gaussianNoise(random) * stddev
         val pitchNoise = gaussianNoise(random) * stddev
 
-        return Rotation(rotation.yaw + yawNoise, rotation.pitch + pitchNoise)
+        // Clamp pitch after noise — same rationale as [applyDrift].
+        val newPitch = (rotation.pitch + pitchNoise).coerceIn(PITCH_HARD_MIN, PITCH_HARD_MAX)
+        return Rotation(rotation.yaw + yawNoise, newPitch)
     }
 
     /**
      * Box-Muller gaussian noise generator. Mean=0, stddev=1.
      *
      * Uses polar form of Box-Muller for numerical stability. The
-     * `coerceAtLeast(Float.MIN_VALUE)` on u1 prevents log(0) → -infinity
+     * `coerceAtLeast(GAUSSIAN_U1_FLOOR)` on u1 prevents log(0) → -infinity
      * when u1 is exactly 0 (possible with [Random.nextFloat]).
+     *
+     * The previous implementation used `Float.MIN_VALUE` (≈1.4e-45) as
+     * the floor, which limited the worst-case spike to ~14.4σ — easily
+     * detectable by Polar AimB. We now use `1e-7`, which limits the
+     * worst-case to ~5.4σ (still rare at ~3e-5 probability, but below
+     * the AimB detection threshold).
      */
     fun gaussianNoise(random: Random): Float {
-        val u1 = random.nextFloat().coerceAtLeast(Float.MIN_VALUE)
+        val u1 = random.nextFloat().coerceAtLeast(GAUSSIAN_U1_FLOOR)
         val u2 = random.nextFloat()
         val z0 = sqrt(-2f * ln(u1)) * cos(2f * Math.PI.toFloat() * u2)
         return z0
@@ -163,7 +194,10 @@ object PolarBypassPureMath {
      * calling the three functions in sequence, but exposed as one call
      * so tests can verify the end-to-end transform.
      *
-     * @return Pair of (finalRotation, clampEngaged)
+     * @return [ProcessResult] containing the final rotation, the
+     *   intermediate clamped rotation (so callers don't have to
+     *   recompute it — the previous implementation called [clampDelta]
+     *   twice per process), and whether the clamp engaged.
      */
     fun process(
         current: Rotation,
@@ -175,11 +209,26 @@ object PolarBypassPureMath {
         driftAmplitude: Float,
         driftFrequency: Float,
         random: Random
-    ): Pair<Rotation, Boolean> {
+    ): ProcessResult {
         val clampEngaged = clampEngages(current, target, maxYawDelta, maxPitchDelta)
         val clamped = clampDelta(current, target, maxYawDelta, maxPitchDelta)
         val drifted = applyDrift(clamped, tickSeconds, driftAmplitude, driftFrequency)
         val noised = applyNoise(drifted, noiseStddev, random)
-        return noised to clampEngaged
+        return ProcessResult(
+            final = noised,
+            clamped = clamped,
+            clampEngaged = clampEngaged
+        )
     }
+
+    /**
+     * Result of [process]. Carries both the final rotation AND the
+     * intermediate clamped rotation so callers (debugger, health monitor)
+     * don't have to recompute it.
+     */
+    data class ProcessResult(
+        val final: Rotation,
+        val clamped: Rotation,
+        val clampEngaged: Boolean
+    )
 }

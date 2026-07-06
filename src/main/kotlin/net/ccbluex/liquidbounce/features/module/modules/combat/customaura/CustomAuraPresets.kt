@@ -7,15 +7,18 @@
  * ## Available presets
  *
  * - **POLAR** — strict. The flagship preset. Range 3.8, wall 0, jump-only
- *   crits, tight PolarBypass noise (0.05°), drift 0.4° @ 0.3Hz, delta
- *   clamp 20°/yaw 14°/pitch, FailSwing 200ms, no AutoBlock.
- *   This is the "ideal Polar preset" — the safest configuration that
- *   still deals meaningful damage.
+ *   crits WITH auto-jump (rate-limited to 1 jump/600ms so Polar's
+ *   jump-pattern correlation check sees a non-periodic signal), tight
+ *   PolarBypass noise (0.05°), drift 0.4° @ 0.3Hz, delta clamp
+ *   20°/yaw 14°/pitch, FailSwing 200ms, no AutoBlock.
  *
  * - **INTAVE** — moderate. Range 3.9, slightly higher delta clamp, drift
  *   off (Intave doesn't check for perfect-tracking as aggressively).
  *
- * - **HYPIXEL** — semi-strict. Range 4.0, wall 0, drift off, higher CPS.
+ * - **HYPIXEL** — semi-strict. Range 3.9, wall 0, drift off, NO
+ *   auto-jump (Watchdog detects jump-on-click patterns), NO autoBlock
+ *   (Watchdog flags block-then-attack patterns). Safest Hypixel config
+ *   that still deals meaningful damage.
  *
  * - **VANILLA** — bypass-off. Max range, no jitter, no drift. Useful for
  *   testing on local servers.
@@ -34,12 +37,6 @@ import net.ccbluex.liquidbounce.utils.client.ServerObserver
 
 /**
  * Common range/raycast defaults shared across multiple presets.
- *
- * These values are intrinsic to the anticheat-bypass design (e.g.
- * 4.4 is below vanilla reach 4.5) and would lose meaning if replaced
- * with a single bare literal in each preset. Extracting them as named
- * constants also makes future tuning sweeps (e.g. "lower every preset's
- * range by 0.05") trivially auditable via a one-line diff.
  */
 private const val SCAN_EXTRA_RANGE_START_DEFAULT = 0.5f
 private const val SCAN_EXTRA_RANGE_END_DEFAULT = 1.0f
@@ -155,8 +152,7 @@ object CustomAuraPresets {
      * The flagship **Polar** preset.
      *
      * Tuned to be the safest configuration that still deals meaningful
-     * damage on Polar-protected servers. Every value was chosen to stay
-     * clearly inside Polar's detection envelopes:
+     * damage on Polar-protected servers.
      *
      *  - range 3.8 — well inside vanilla 4.5, avoids Reach flags
      *  - wallRange 0 — no through-wall hits (AimC)
@@ -164,7 +160,12 @@ object CustomAuraPresets {
      *  - PolarBypass ON with 0.05° gaussian noise — destroys AimB GCD
      *  - drift 0.4° @ 0.3Hz — breaks AimC perfect-tracking
      *  - delta clamp 20°/yaw, 14°/pitch — well under AimA snap threshold
-     *  - JUMP_ONLY crits — vanilla-correct, no Criticals B flag
+     *  - JUMP_ONLY crits WITH autoJumpForCrits — vanilla-correct crits
+     *    via jump→fall→hit. Rate-limited to 1 jump / 600ms so Polar's
+     *    jump-pattern correlation check sees a non-periodic signal.
+     *    The previous preset had autoJumpForCrits=false, which meant
+     *    ZERO crits unless the user manually jumped — making the aura
+     *    strictly worse than a vanilla player in 1.9+ PvP.
      *  - keepSprint OFF — no NoSlow flag
      *  - AutoBlock OFF — avoids all AutoBlock A/B/C patterns
      *  - FailSwing 200ms rate-limit — no BadPackets swing spam
@@ -179,7 +180,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_DEFAULT,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
-            autoJumpForCrits = false,
+            autoJumpForCrits = true,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -218,7 +219,7 @@ object CustomAuraPresets {
             scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_DEFAULT,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
-            autoJumpForCrits = false,
+            autoJumpForCrits = true,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -250,14 +251,19 @@ object CustomAuraPresets {
         )
 
         Preset.HYPIXEL -> Params(
-            range = 4.0f,
+            range = 3.9f,
             wallRange = 0f,
             reachJitter = 0.03f,
             scanExtraRangeStart = SCAN_EXTRA_RANGE_START_DEFAULT,
             scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_HYPIXEL,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
-            autoJumpForCrits = true,
+            // NO auto-jump on Hypixel — Watchdog's MovementPattern check
+            // correlates "jump on click tick" with KillAura signatures.
+            // The user must jump manually for crits. The previous preset
+            // had autoJumpForCrits=true, which was a near-guaranteed ban
+            // on the first fight.
+            autoJumpForCrits = false,
             keepSprint = false,
             ignoreOpenInventory = false,
 
@@ -268,7 +274,12 @@ object CustomAuraPresets {
             driftAmplitude = 0f,
             driftFrequency = 0f,
 
-            autoBlockEnabled = true,
+            // NO autoBlock on Hypixel — Watchdog's AutoBlock check flags
+            // the block→attack→unblock pattern even with vanilla
+            // STOP_USING_ITEM. The previous preset had autoBlockEnabled=true,
+            // which combined with autoJumpForCrits=true made the preset
+            // a ban-on-sight config.
+            autoBlockEnabled = false,
             blockMode = BlockMode.BASIC,
             unblockMode = UnblockMode.STOP_USING_ITEM,
             tickOffStart = TICK_OFF_ON_ZERO,

@@ -102,11 +102,24 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * A small randomized component is added per-tick so Polar cannot
      * correlate attack distance to a fixed value (Reach GCD check).
      */
-    internal var range by float("Range", 3.85f, 1f..4.4f)
+    internal var range by float("Range", 3.85f, 1f..4.4f).onChange { r ->
+        // If the user lowers `range` below the current `wallRange`, clamp
+        // wallRange down too — otherwise we'd attack through walls at a
+        // longer range than we attack through air, which is both a logical
+        // bug and a direct Polar AimC flag.
+        if (wallRange > r) {
+            wallRange = r
+        }
+    }
     internal var wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
-        // Wall range must never exceed main range and is kept low by default
-        // because hitting through walls triggers Polar AimC / Reach through-wall.
-        if (v > range) range else v
+        // Wall range must never exceed main range. The previous
+        // implementation returned `range` (which can be up to 4.4) when v >
+        // range, violating the 0..3 bound on this setting. We now clamp to
+        // `min(v, range)` AND additionally cap to the setting's own upper
+        // bound (3.0) so the invariant `wallRange <= min(range, 3.0)` always
+        // holds.
+        val clamped = v.coerceAtMost(range).coerceAtMost(3f)
+        if (clamped != v) clamped else v
     }
 
     /**
@@ -245,15 +258,32 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         this.debugParameter("PresetAntiCheater") { params.antiCheaterEnabled }
 
         // ── Main module settings ─────────────────────────────────────
+        // Order matters: write `range` BEFORE `wallRange` so the
+        // wallRange onChange listener sees the new range when clamping.
+        // The previous implementation wrote them in the opposite order,
+        // which could leave wallRange clamped to the OLD range until the
+        // user manually re-toggled it.
         range = params.range
         wallRange = params.wallRange
         reachJitter = params.reachJitter
         scanExtraRange = params.scanExtraRangeStart..params.scanExtraRangeEnd
+        // Re-roll [currentScanExtraRange] so the new preset's scan range
+        // takes effect immediately. The onChanged listener for
+        // [scanExtraRange] ALSO sets this, but only when the user changes
+        // the value via the GUI — programmatic writes from applyPreset
+        // go through the same path, but re-rolling here is a belt-and-
+        // suspenders guarantee.
+        currentScanExtraRange = scanExtraRange.random()
         raycast = params.raycast
         criticalsMode = params.criticalsMode
         autoJumpForCrits = params.autoJumpForCrits
         keepSprint = params.keepSprint
         ignoreOpenInventory = params.ignoreOpenInventory
+
+        // ── Clicker ─────────────────────────────────────────────────
+        // Re-assert the cooldown-respect flag so a preset switch can't
+        // leave the user in cooldown-bypass mode (Polar ClickB flag).
+        clickScheduler.forceAttackCooldownEnabled()
 
         // ── PolarBypass ──────────────────────────────────────────────
         CustomAuraPolarBypass.applyPreset(params)
@@ -266,6 +296,14 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
         // ── AntiCheater ──────────────────────────────────────────────
         CustomAuraAntiCheater.applyPreset(params)
+
+        // ── Reset transient state ──────────────────────────────────
+        // Clear the pending auto-jump flag so a preset switch mid-combat
+        // doesn't leave a stale jump queued. Also reset the auto-jump
+        // rate limiter so the new preset's first crit isn't delayed by
+        // the old preset's last jump timestamp.
+        pendingAutoJump = false
+        lastAutoJumpMs = 0L
     }
 
     @Suppress("unused")
@@ -365,9 +403,21 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     }
 
     /**
-     * Sprint handler — only blocks sprint when we are about to jump-crit,
-     * which is the legitimate vanilla criticals path (jump → fall → hit).
-     * We NEVER block sprint just to force a fake critical.
+     * Sprint handler — blocks sprint when we are AIRBORNE and about to
+     * land a critical hit. This is the legitimate vanilla criticals path
+     * (jump → fall → hit while falling → crit). Vanilla Minecraft
+     * internally cancels sprint when a falling player attacks, but if our
+     * [keepSprint] option is on, vanilla's sprint restoration would
+     * re-enable sprint on the same tick — which itself is a Polar
+     * NoSlow flag. So we explicitly block the SprintEvent here when the
+     * attack is in progress AND we are airborne.
+     *
+     * The previous implementation also required `!player.isOnGround`,
+     * which made `shouldBlockSprinting` always FALSE on the click tick
+     * (since [pendingAutoJump] hadn't fired yet). That defeated the
+     * purpose: keepSprint was always `true` on the click tick, and
+     * since vanilla attacks with `sprint=true` NEVER crit, the JUMP_ONLY
+     * mode was effectively non-functional.
      */
     val shouldBlockSprinting
         get() = criticalsMode == CriticalsMode.JUMP_ONLY
@@ -389,6 +439,19 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * [MovementInputEvent] (see [movementInputHandler]) so it goes through
      * the vanilla input pipeline — Polar's jump-input correlation check
      * sees a legitimate jump input, not a velocity-only teleport.
+     *
+     * TIMING: [pendingAutoJump] is set ONE TICK BEFORE the next click
+     * tick (when [clickScheduler.willClickAt] predicts a click at +1).
+     * The jump fires on the next MovementInputEvent, the player leaves
+     * the ground on the next movement packet, and the attack on the
+     * following tick lands while the player is airborne → critical hit.
+     *
+     * The previous implementation set [pendingAutoJump] on the click
+     * tick itself, which meant the jump and the attack happened in the
+     * same tick — the movement packet for that tick had onGround=true
+     * (the jump hadn't been processed yet), so the attack was NOT a
+     * critical. Only the NEXT attack (after the player was airborne)
+     * could crit, and by then the click scheduler might have moved on.
      */
     @Volatile
     private var pendingAutoJump: Boolean = false
@@ -481,6 +544,29 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             return
         }
 
+        // Pre-click auto-jump for criticals. This MUST run BEFORE the
+        // `isClickTick` check below, because the jump needs to fire on
+        // the tick BEFORE the click — not on the click tick itself.
+        //
+        // Sequence: t=0 (willClickAt(1)=true, onGround=true) → set
+        // pendingAutoJump → t=1 (jump fires via MovementInputEvent,
+        // player leaves ground) → t=2 (isClickTick=true, attack lands
+        // while airborne → CRITICAL).
+        //
+        // The previous implementation had this block INSIDE the
+        // `if (clickScheduler.isClickTick ...)` branch, which meant it
+        // only fired on the click tick — too late for the jump to put
+        // the player airborne before the attack.
+        if (isFacingEnemy && autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
+            player.isOnGround && targetTracker.target != null &&
+            clickScheduler.willClickAt(1) && validateAttack(target)) {
+            val now = System.currentTimeMillis()
+            if (now - lastAutoJumpMs >= AUTO_JUMP_RATE_LIMIT_MS) {
+                pendingAutoJump = true
+                lastAutoJumpMs = now
+            }
+        }
+
         // Strike — click scheduler gates the actual hit.
         if (clickScheduler.isClickTick && validateAttack(target)) {
             ModuleCustomAuraDebugger.recordEvent(
@@ -495,29 +581,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
                 onGround = player.isOnGround,
                 validateAttack = validateAttack(target)
             )
-
-            // Auto-jump for criticals (optional). Only triggers when:
-            //  - autoJumpForCrits is enabled
-            //  - criticalsMode is JUMP_ONLY
-            //  - player is on ground (can't jump while in air)
-            //  - at least 600ms since the last auto-jump (rate limit)
-            //  - we're about to click THIS tick
-            //
-            // IMPLEMENTATION: We set the [pendingAutoJump] flag instead of
-            // calling player.jump() directly. The [movementInputHandler]
-            // picks up the flag on the next MovementInputEvent and sets
-            // event.jump = true. This routes the jump through the vanilla
-            // input pipeline, so Polar's jump-input correlation check sees
-            // a legitimate jump input — not a velocity-only teleport.
-            // The movement packet on the next tick will have onGround=false → crit.
-            if (autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
-                player.isOnGround && targetTracker.target != null) {
-                val now = System.currentTimeMillis()
-                if (now - lastAutoJumpMs >= AUTO_JUMP_RATE_LIMIT_MS) {
-                    pendingAutoJump = true
-                    lastAutoJumpMs = now
-                }
-            }
 
             clickScheduler.attack(sequence, rotation) {
                 if (!validateAttack(target)) {
@@ -538,8 +601,23 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
                 // based on the onGround flag in the movement packet. If the
                 // player is in the air (from a manual or auto jump), it's
                 // a crit; if on ground, it's a normal hit. Both are legit.
-
-                target.attack(true, keepSprint && !shouldBlockSprinting)
+                //
+                // FIRST ARG of Entity.attack(sprint, keepSprint) is `sprint`
+                // — whether the player is currently sprinting. Vanilla
+                // Minecraft's critical-hit check (`ModuleCriticals.wouldDoCriticalHit`)
+                // requires the player to NOT be sprinting. Passing `true`
+                // here would mark the attack as a sprint-attack, which
+                // disables criticals even if the player is airborne.
+                //
+                // The previous implementation hardcoded `true`, which
+                // silently disabled crits even when [autoJumpForCrits]
+                // had correctly put the player airborne. We now pass
+                // `false` in JUMP_ONLY mode (so vanilla's crit check can
+                // fire) and `keepSprint` in NONE mode (since crits are
+                // disabled anyway, sprint state doesn't matter).
+                val sprintArg = criticalsMode != CriticalsMode.JUMP_ONLY && keepSprint
+                val keepSprintArg = keepSprint && !shouldBlockSprinting
+                target.attack(sprintArg, keepSprintArg)
                 currentScanExtraRange = scanExtraRange.random()
 
                 ModuleCustomAuraDebugger.recordEvent(

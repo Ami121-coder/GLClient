@@ -315,7 +315,7 @@ class PolarBypassPureMathTest {
     fun process_noClamp() {
         val current = Rotation(0f, 0f)
         val target = Rotation(10f, 5f)
-        val (result, clampEngaged) = PolarBypassPureMath.process(
+        val result = PolarBypassPureMath.process(
             current = current,
             target = target,
             tickSeconds = 1.0f,
@@ -326,9 +326,9 @@ class PolarBypassPureMathTest {
             driftFrequency = 0.3f,
             random = Random(0)
         )
-        assertFalse(clampEngaged)
-        assertEquals(target.yaw, result.yaw, 0.001f)
-        assertEquals(target.pitch, result.pitch, 0.001f)
+        assertFalse(result.clampEngaged)
+        assertEquals(target.yaw, result.final.yaw, 0.001f)
+        assertEquals(target.pitch, result.final.pitch, 0.001f)
     }
 
     @Test
@@ -336,7 +336,7 @@ class PolarBypassPureMathTest {
     fun process_clampEngages() {
         val current = Rotation(0f, 0f)
         val target = Rotation(50f, 30f)
-        val (result, clampEngaged) = PolarBypassPureMath.process(
+        val result = PolarBypassPureMath.process(
             current = current,
             target = target,
             tickSeconds = 1.0f,
@@ -347,10 +347,15 @@ class PolarBypassPureMathTest {
             driftFrequency = 0.3f,
             random = Random(0)
         )
-        assertTrue(clampEngaged)
-        // Without noise/drift, result should equal clamped target.
-        assertEquals(20f, result.yaw, 0.001f)
-        assertEquals(15f, result.pitch, 0.001f)
+        assertTrue(result.clampEngaged)
+        // Without noise/drift, final should equal clamped target.
+        assertEquals(20f, result.final.yaw, 0.001f)
+        assertEquals(15f, result.final.pitch, 0.001f)
+        // The clamped intermediate should also be available without a
+        // second clampDelta call — this is the optimization that
+        // prevents double work in [CustomAuraPolarBypass.process].
+        assertEquals(20f, result.clamped.yaw, 0.001f)
+        assertEquals(15f, result.clamped.pitch, 0.001f)
     }
 
     @Test
@@ -364,7 +369,7 @@ class PolarBypassPureMathTest {
         val amplitude = 0.4f
         val stddev = 0.05f
         repeat(1_000) { i ->
-            val (result, _) = PolarBypassPureMath.process(
+            val result = PolarBypassPureMath.process(
                 current = current,
                 target = target,
                 tickSeconds = i * 0.1f,
@@ -375,10 +380,64 @@ class PolarBypassPureMathTest {
                 driftFrequency = 0.3f,
                 random = random
             )
-            val yawDelta = abs(result.yaw - target.yaw)
-            val pitchDelta = abs(result.pitch - target.pitch)
+            val yawDelta = abs(result.final.yaw - target.yaw)
+            val pitchDelta = abs(result.final.pitch - target.pitch)
             assertTrue(yawDelta < amplitude + 5f * stddev + 0.01f, "yaw drift+noise too big: $yawDelta")
             assertTrue(pitchDelta < amplitude * 0.6f + 5f * stddev + 0.01f, "pitch drift+noise too big: $pitchDelta")
+        }
+    }
+
+    @Test
+    @DisplayName("process: pitch never exceeds vanilla [-90, 90] after drift+noise")
+    fun process_pitchClampedToVanillaRange() {
+        // Even with extreme drift amplitude and noise, pitch must stay
+        // in [-90, 90] so client and server agree on the rotation.
+        val current = Rotation(0f, 85f)  // already near the upper limit
+        val target = Rotation(0f, 89f)
+        val random = Random(7)
+        repeat(10_000) { i ->
+            val result = PolarBypassPureMath.process(
+                current = current,
+                target = target,
+                tickSeconds = i * 0.1f,
+                maxYawDelta = 30f,
+                maxPitchDelta = 30f,
+                noiseStddev = 0.5f,  // large noise
+                driftAmplitude = 2.0f,  // large drift
+                driftFrequency = 1.0f,
+                random = random
+            )
+            assertTrue(result.final.pitch in -90f..90f,
+                "pitch ${result.final.pitch} out of vanilla range at i=$i")
+            assertTrue(result.clamped.pitch in -90f..90f,
+                "clamped pitch ${result.clamped.pitch} out of vanilla range at i=$i")
+        }
+    }
+
+    @Test
+    @DisplayName("gaussianNoise: worst-case spike bounded by ~5.4σ (no 14σ outliers)")
+    fun gaussianNoise_boundedSpike() {
+        // The previous Float.MIN_VALUE floor allowed nextFloat()==0 to
+        // produce a 14.4σ spike. With the new 1e-7 floor, the worst
+        // case is sqrt(-2*ln(1e-7)) ≈ 5.4σ.
+        //
+        // We seed a Random that we manipulate to force u1=0 (the
+        // pathological case) and verify the spike is bounded.
+        val adversarialRandom = object : Random() {
+            private var callCount = 0
+            override fun nextFloat(): Float {
+                callCount++
+                // First call (u1 in Box-Muller) returns 0 to trigger
+                // the floor; subsequent calls return a normal value.
+                return if (callCount % 2 == 1) 0f else 0.5f
+            }
+            override fun nextBits(bitCount: Int): Int = 0
+        }
+        repeat(1_000) {
+            val z = PolarBypassPureMath.gaussianNoise(adversarialRandom)
+            // 5.4σ + small slack for floating-point error.
+            assertTrue(abs(z) <= 6.0f, "gaussian spike $z exceeded 6σ bound")
+            assertFalse(z.isNaN() || z.isInfinite(), "gaussian produced NaN/Inf")
         }
     }
 }

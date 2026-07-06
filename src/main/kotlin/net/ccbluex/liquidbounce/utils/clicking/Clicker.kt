@@ -52,7 +52,10 @@ open class Clicker<T>(
 
     showCooldown: Boolean,
     maxCps: Int = 60,
-    name: String = "Clicker"
+    name: String = "Clicker",
+    defaultCps: IntRange = 5..8,
+    defaultPattern: ClickPatterns = ClickPatterns.STABILIZED,
+    defaultAttackCooldown: Boolean = true
 ) : Configurable(name, aliases = arrayOf("ClickScheduler")), EventListener where T : EventListener {
 
     companion object {
@@ -64,12 +67,12 @@ open class Clicker<T>(
     }
 
     // Options
-    private val cps by intRange("CPS", 5..8, 1..maxCps, "clicks")
+    private val cps by intRange("CPS", defaultCps, 1..maxCps, "clicks")
         .onChanged {
             fill()
         }
 
-    private val pattern by enumChoice("Technique", ClickPatterns.STABILIZED)
+    private val pattern by enumChoice("Technique", defaultPattern)
         .onChanged {
             fill()
         }
@@ -86,11 +89,31 @@ open class Clicker<T>(
      *
      * This is useful for anti-cheats that detect if you are ignoring this cooldown.
      * Applies to the FailSwing feature as well.
+     *
+     * The default value is supplied by the constructor caller — modules that
+     * REQUIRE cooldown respect (e.g. combat auras tuned for modern anticheats)
+     * can pass `defaultAttackCooldown = true` AND additionally call
+     * [forceAttackCooldownEnabled] to re-assert it after every user override.
      */
     private val attackCooldown: Value<Boolean>? = if (keyBinding == mc.options.attackKey) {
-        boolean("AttackCooldown", true)
+        boolean("AttackCooldown", defaultAttackCooldown)
     } else {
         null
+    }
+
+    /**
+     * Re-assert that the AttackCooldown value is enabled. Combat modules
+     * that MUST honor vanilla cooldown (1.9+ combat, Polar/Intave bypass)
+     * should call this from their tick handler to defend against the user
+     * accidentally disabling it in the GUI.
+     *
+     * No-op when [attackCooldown] is null (i.e. the clicker is not bound
+     * to the attack key) or when the value is already enabled.
+     */
+    fun forceAttackCooldownEnabled() {
+        if (attackCooldown != null && !attackCooldown.get()) {
+            attackCooldown.set(true)
+        }
     }
 
     private val passesAttackCooldown

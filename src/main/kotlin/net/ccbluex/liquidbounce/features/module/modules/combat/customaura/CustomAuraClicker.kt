@@ -8,15 +8,23 @@
  *    produces a much noisier CPS distribution, which Polar ClickA
  *    (cps consistency) struggles to fingerprint.
  *  - Forces AttackCooldown=true (vanilla 1.9+ cooldown respect) so we
- *    never trip ClickB (cooldown bypass).
+ *    never trip ClickB (cooldown bypass). The base Clicker exposes this
+ *    as a user-toggleable value; we re-assert it on every tick so the
+ *    user cannot accidentally disable it.
  *  - On every successful hit, schedules a small random "post-hit pause"
  *    of 0-2 ticks so the click train is not perfectly periodic even
  *    under the butterfly pattern.
+ *
+ * 1.9+ ONLY: the cooldown bypass assumes the vanilla 1.9+ attack cooldown
+ * mechanic. On 1.8 servers the cooldown flag is a no-op and the clicker
+ * falls back to pure CPS scheduling.
  */
 @file:Suppress("WildcardImport")
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura
 
 import net.ccbluex.liquidbounce.event.Sequence
+import net.ccbluex.liquidbounce.event.events.GameTickEvent
+import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
 import net.ccbluex.liquidbounce.utils.clicking.Clicker
 import net.ccbluex.liquidbounce.utils.client.mc
@@ -32,7 +40,11 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
     keyBinding = mc.options.attackKey,
     showCooldown = true,
     maxCps = 20,
-    name = "Clicker"
+    name = "Clicker",
+    // 1.9+-tuned defaults — out-click cheaters without tripping ClickA/B.
+    defaultCps = 9..12,
+    defaultPattern = ClickPatterns.BUTTERFLY,
+    defaultAttackCooldown = true
 ) {
     /**
      * Post-hit pause range. After a successful attack we wait this many
@@ -44,6 +56,18 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
     private val postHitPause by intRange("PostHitPause", 0..1, 0..3, "ticks")
 
     private var pausedUntilTick: Long = 0L
+
+    /**
+     * Re-assert the AttackCooldown flag every tick so the user cannot
+     * accidentally disable it from the GUI. This is the defensive layer
+     * on top of [defaultAttackCooldown]; without it a single GUI click
+     * would silently drop us into cooldown-bypass mode and trip Polar
+     * ClickB on the next attack.
+     */
+    @Suppress("unused")
+    private val forceCooldownHandler = handler<GameTickEvent> {
+        forceAttackCooldownEnabled()
+    }
 
     /**
      * Polar-safe attack routine — NEVER sends a duplicate PlayerMoveC2SPacket.
@@ -80,18 +104,17 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
 
         click(attack)
 
-        // Schedule the next pause if the click landed.
+        // Schedule the next pause if the click landed. Compute the pause
+        // ONCE and reuse it for both the actual scheduling and the debug
+        // output — the previous implementation called postHitPause.random()
+        // twice, which displayed a different value than the one applied.
         if (clickAmount != null && clickAmount!! > 0) {
-            pausedUntilTick = player.age.toLong() + postHitPause.random().toLong()
+            val pause = postHitPause.random().toLong()
+            pausedUntilTick = player.age.toLong() + pause
             this.debugParameter("Clicker_Landed") { clickAmount }
-            this.debugParameter("Clicker_PostHitPause") { postHitPause.random() }
+            this.debugParameter("Clicker_PostHitPause") { pause }
         } else {
             this.debugParameter("Clicker_Landed") { 0 }
         }
     }
-
-    /**
-     * Random helper exposed for tests.
-     */
-    internal fun nextPauseTicks(): Int = postHitPause.random()
 }
