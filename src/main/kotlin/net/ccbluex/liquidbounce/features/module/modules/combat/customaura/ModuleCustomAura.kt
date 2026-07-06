@@ -110,6 +110,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         if (wallRange > r) {
             wallRange = r
         }
+        r
     }
     internal var wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
         // Wall range must never exceed main range. The previous
@@ -118,7 +119,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         // `min(v, range)` AND additionally cap to the setting's own upper
         // bound (3.0) so the invariant `wallRange <= min(range, 3.0)` always
         // holds.
-        val clamped = v.coerceAtMost(range).coerceAtMost(3f)
+        val clamped: Float = v.coerceAtMost(range).coerceAtMost(3f)
         if (clamped != v) clamped else v
     }
 

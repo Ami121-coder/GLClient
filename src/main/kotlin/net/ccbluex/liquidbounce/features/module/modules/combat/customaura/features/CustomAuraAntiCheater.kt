@@ -269,7 +269,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         val maxDistSq = (longRangeHit * longRangeHit).toDouble()
         var nearestAttacker: PlayerEntity? = null
         var nearestDistSq = Double.MAX_VALUE
-        for (entity in player.world.entities) {
+        for (entity in player.world.getEntities()) {
             if (entity == player) continue
             if (entity !is PlayerEntity) continue
             if (entity.isSpectator || entity.isDead) continue
