@@ -55,11 +55,15 @@ jobs:
       - name: Grant permissions to src-theme
         run: sudo chmod -R 777 src-theme
 
-      - name: Run unit tests
+      - name: Compile and run unit tests
         env:
           CI: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew test --no-daemon --stacktrace
+        # Use 'genSources test' — genSources must run before compileJava
+        # because Fabric Loom's compileJava depends on the minecraft jar
+        # that genSourcesWithVineflower produces. Running 'test' alone
+        # triggers an implicit-dependency validation error in Gradle 8.14.
+        run: ./gradlew genSources test --no-daemon --stacktrace
 
       - name: Upload test results
         if: always()
