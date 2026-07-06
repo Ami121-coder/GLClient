@@ -24,6 +24,7 @@ import net.ccbluex.liquidbounce.event.events.PacketEvent
 import net.ccbluex.liquidbounce.event.events.WorldRenderEvent
 import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.event.tickHandler
+import net.ccbluex.liquidbounce.features.module.Category
 import net.ccbluex.liquidbounce.features.module.ClientModule
 import net.ccbluex.liquidbounce.features.module.ModuleManager
 import net.ccbluex.liquidbounce.render.engine.type.Color4b
@@ -365,13 +366,12 @@ object ModuleFlagCheck : ClientModule("FlagCheck", Category.MISC, aliases = arra
      * Returns a comma-separated list of currently-running combat modules.
      * Used to attribute flags to the module that likely caused them.
      *
-     * Uses [ModuleManager.getModules] (not the private `modules` field)
-     * and accesses [ClientModule.category] via the FQN to avoid a name
-     * clash with kotlin.text.CharCategory that breaks wildcard imports.
+     * Uses [ModuleManager.getModules] (the public API) — the `modules`
+     * field itself is private.
      */
     private fun activeCombatModules(): String {
         val running = ModuleManager.getModules().filter { mod ->
-            mod.running && mod.category == net.ccbluex.liquidbounce.features.module.Category.COMBAT
+            mod.running && mod.category == Category.COMBAT
         }.map { it.name }
         return if (running.isEmpty()) "<none>" else running.joinToString(", ")
     }
