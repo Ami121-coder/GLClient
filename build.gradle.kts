@@ -319,6 +319,17 @@ tasks.withType<JavaCompile>().configureEach {
 
     // Minecraft 1.21.1 upwards uses Java 21.
     options.release = 21
+
+    // Fabric Loom's :genSourcesWithVineflower produces the merged-named
+    // Minecraft jar that compileJava resolves against. Without an explicit
+    // dependency declaration, Gradle 8.14's task-input validation fails
+    // with "Task ':compileJava' uses this output of task
+    // ':genSourcesWithVineflower' without declaring an explicit or
+    // implicit dependency" — even when genSources is listed before the
+    // test task on the command line. Declaring mustRunAfter lets Gradle
+    // order the tasks correctly while still allowing them to be skipped
+    // when the loom cache is fresh.
+    mustRunAfter("genSourcesWithVineflower")
 }
 
 tasks.withType<Test>().configureEach {
