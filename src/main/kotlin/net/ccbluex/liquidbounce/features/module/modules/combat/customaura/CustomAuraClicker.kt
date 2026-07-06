@@ -25,6 +25,7 @@ import net.ccbluex.liquidbounce.utils.entity.isBlockAction
 import net.ccbluex.liquidbounce.utils.kotlin.random
 import net.ccbluex.liquidbounce.features.module.modules.exploit.ModuleMultiActions
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAutoBlock
+import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter
 
 object CustomAuraClicker : Clicker<ModuleCustomAura>(
     parent = ModuleCustomAura,
@@ -51,32 +52,22 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
      */
     suspend fun attack(sequence: Sequence, rotation: Rotation? = null, attack: () -> Boolean) {
         if (!isClickTick) {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_SkipReason", "not_click_tick"
-            )
+            this.debugParameter("Clicker_SkipReason") { "not_click_tick" }
             return
         }
 
         // Honor post-hit pause.
         if (player.age.toLong() < pausedUntilTick) {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_SkipReason", "post_hit_pause"
-            )
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_PausedUntil", pausedUntilTick
-            )
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_PlayerAge", player.age
-            )
+            this.debugParameter("Clicker_SkipReason") { "post_hit_pause" }
+            this.debugParameter("Clicker_PausedUntil") { pausedUntilTick }
+            this.debugParameter("Clicker_PlayerAge") { player.age }
             return
         }
 
         // Make sure we are not stuck blocking — but use vanilla stop only.
         if (player.isBlockAction) {
             if (!CustomAuraAutoBlock.enabled && !ModuleMultiActions.mayAttackWhileUsing()) {
-                net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                    this, "Clicker_SkipReason", "blocking_no_autoblock"
-                )
+                this.debugParameter("Clicker_SkipReason") { "blocking_no_autoblock" }
                 return
             }
             if (CustomAuraAutoBlock.enabled && CustomAuraAutoBlock.shouldUnblockToHit) {
@@ -92,16 +83,10 @@ object CustomAuraClicker : Clicker<ModuleCustomAura>(
         // Schedule the next pause if the click landed.
         if (clickAmount != null && clickAmount!! > 0) {
             pausedUntilTick = player.age.toLong() + postHitPause.random().toLong()
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_Landed", clickAmount
-            )
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_PostHitPause", postHitPause.random()
-            )
+            this.debugParameter("Clicker_Landed") { clickAmount }
+            this.debugParameter("Clicker_PostHitPause") { postHitPause.random() }
         } else {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "Clicker_Landed", 0
-            )
+            this.debugParameter("Clicker_Landed") { 0 }
         }
     }
 

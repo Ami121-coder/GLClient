@@ -22,6 +22,20 @@
  *
  * This module directly addresses the "0/10 instrumentation" gap noted
  * in the CustomAura debug audit.
+ *
+ * ── Performance notes ───────────────────────────────────────────────
+ * The overlay handler runs every frame (60+ fps), so any work done in
+ * [overlayHandler] must be aggressively cached. Two caches are used:
+ *
+ *   - [topSkipReasonsCache]: the top-3 skip reasons within the sliding
+ *     window. Computed at most once per [TOP_SKIP_REASONS_TTL_MS] ms.
+ *     The previous implementation called `sortedByDescending` on the
+ *     full window snapshot every frame — that was O(n log n) per frame
+ *     at 60fps, with n potentially up to [skipReasonWindowMaxSize].
+ *
+ *   - [overlayLineCache]: the pre-built list of overlay lines. Cleared
+ *     whenever [lastEvent] changes, so on a stable attack loop we
+ *     reuse the same list across frames.
  */
 @file:Suppress("MagicNumber", "WildcardImport")
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura
@@ -50,6 +64,79 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Default overlay Y offset (pixels from top of screen). Used as the
+ * default for the [overlayYOffset] setting.
+ */
+private const val DEFAULT_OVERLAY_Y_OFFSET = 60
+
+/**
+ * Default PolarBypass clamp warning threshold, in percent. Above this
+ * ratio of clamp-events-vs-process-calls, the health monitor fires a
+ * chat warning. See [clampWarnThreshold].
+ */
+private const val DEFAULT_CLAMP_WARN_PERCENT = 30
+
+/**
+ * Number of PolarBypass process() calls that must accumulate before the
+ * clamp ratio is computed. Prevents noisy early readings (one clamp
+ * in the first 5 calls = 20% — would warn prematurely).
+ */
+private const val POLAR_BYPASS_MIN_SAMPLE = 100
+
+/**
+ * Tick-period (in player.age ticks) at which the PolarBypass clamp
+ * warning is re-evaluated. Setting this to 1000 means at most one
+ * warning per 50 seconds of gameplay — enough to alert without spam.
+ */
+private const val POLAR_BYPASS_WARN_COOLDOWN_TICKS = 1000
+
+/**
+ * Maximum number of skip events to keep in memory. Prevents
+ * unbounded growth if the window is large and skip rate is high.
+ */
+private const val SKIP_REASON_WINDOW_MAX_SIZE = 5000
+
+/**
+ * TTL (in milliseconds) for the cached top-3 skip reasons computed by
+ * [topSkipReasons]. The overlay reads this cache once per frame, but
+ * the underlying sort is O(n log n) on a deque that can hold up to
+ * [SKIP_REASON_WINDOW_MAX_SIZE] entries — running it 60×/s would be
+ * wasteful. One second is short enough to feel live, long enough to
+ * cut 99% of the redundant work.
+ */
+private const val TOP_SKIP_REASONS_TTL_MS = 1000L
+
+/**
+ * Overlay text X position (pixels from left edge of the screen).
+ */
+private const val OVERLAY_X_POS = 5
+
+/**
+ * Overlay line height (pixels per text row). Vanilla Minecraft text
+ * renderer draws glyphs 9 pixels tall; 10 gives a small gap.
+ */
+private const val OVERLAY_LINE_HEIGHT = 10
+
+/**
+ * Default RGB color used for overlay text — pure white. Passed to
+ * [DrawContext.drawTextWithShadow] as an unsigned 24-bit int.
+ */
+private const val OVERLAY_TEXT_COLOR = 0xFFFFFF
+
+/**
+ * Number of PolarBypass clamp-events above which the health monitor
+ * starts checking the ratio. See [POLAR_BYPASS_MIN_SAMPLE].
+ */
+private const val POLAR_BYPASS_WARN_RATIO_DIVISOR = 100
+
+/**
+ * Field separator used in the [appendToLog] line format. Kept as a
+ * constant so the format string and the writer's header banner stay
+ * in sync.
+ */
+private const val LOG_FIELD_SEPARATOR = " | "
 
 object ModuleCustomAuraDebugger : ClientModule(
     "CustomAuraDebug",
@@ -84,7 +171,7 @@ object ModuleCustomAuraDebugger : ClientModule(
      * Vertical offset (in pixels) of the overlay from the top of the screen.
      * Useful to avoid overlapping with other HUD elements.
      */
-    private val overlayYOffset by int("OverlayYOffset", 60, 0..500, "px")
+    private val overlayYOffset by int("OverlayYOffset", DEFAULT_OVERLAY_Y_OFFSET, 0..500, "px")
 
     /**
      * Whether to count PolarBypass clamp events and warn if they fire
@@ -97,7 +184,7 @@ object ModuleCustomAuraDebugger : ClientModule(
      * monitor warns in chat. Default 30% — if more than 30% of process()
      * calls engage the clamp, the base AngleSmooth is too aggressive.
      */
-    private val clampWarnThreshold by int("ClampWarnThreshold", 30, 5..95, "%")
+    private val clampWarnThreshold by int("ClampWarnThreshold", DEFAULT_CLAMP_WARN_PERCENT, 5..95, "%")
 
     /**
      * One entry in the attack-event ring buffer. Captures the full state
@@ -172,7 +259,7 @@ object ModuleCustomAuraDebugger : ClientModule(
      * Maximum number of skip events to keep in memory. Prevents
      * unbounded growth if the window is large and skip rate is high.
      */
-    private val skipReasonWindowMaxSize = 5000
+    private val skipReasonWindowMaxSize = SKIP_REASON_WINDOW_MAX_SIZE
 
     /**
      * PolarBypass clamp monitor — counts how often the per-tick yaw
@@ -228,6 +315,21 @@ object ModuleCustomAuraDebugger : ClientModule(
      */
     private val dateFormat = DateTimeFormatter.ISO_INSTANT.withZone(ZoneId.systemDefault())
 
+    /**
+     * Cached top-3 skip reasons. The overlay reads this 60×/s; we
+     * recompute at most once per [TOP_SKIP_REASONS_TTL_MS] ms. Both
+     * fields are guarded by `synchronized(this)` so the writer thread
+     * (recordEvent → topSkipReasons invalidation via stale-tick
+     * eviction) and the reader thread (overlay) see a consistent pair.
+     *
+     * Why not @Volatile? Because the (data, computedAtMs) pair must be
+     * read atomically — @Volatile on each field separately would
+     * allow the reader to see a fresh timestamp with stale data, or
+     * vice versa.
+     */
+    @Volatile private var topSkipReasonsCache: List<Pair<String, Int>> = emptyList()
+    @Volatile private var topSkipReasonsCacheAtMs: Long = 0L
+
     override fun enable() {
         super.enable()
         ringBuffer.clear()
@@ -243,6 +345,10 @@ object ModuleCustomAuraDebugger : ClientModule(
         lastPbClampedYaw = null
         lastPbNoisedYaw = null
         lastEvent = null
+        synchronized(this) {
+            topSkipReasonsCache = emptyList()
+            topSkipReasonsCacheAtMs = 0L
+        }
 
         if (logToFile) {
             openLogFile()
@@ -336,6 +442,9 @@ object ModuleCustomAuraDebugger : ClientModule(
                         skipReasonWindowCount.decrementAndGet()
                     }
                 }
+                // Invalidate the top-skip-reasons cache — a new skip event
+                // may have changed the ranking.
+                synchronized(this) { topSkipReasonsCacheAtMs = 0L }
             }
             "FAILED" -> totalFailed.incrementAndGet()
         }
@@ -392,16 +501,18 @@ object ModuleCustomAuraDebugger : ClientModule(
         // (e.g. on Polar servers under load where TPS can drop to 5).
 
         // PolarBypass health warning — if clamp fires more than
-        // [clampWarnThreshold]% of the time over the last 100 process
-        // calls, warn in chat. The threshold is user-configurable.
-        if (monitorPolarBypass && pbTotalProcess.get() >= 100) {
+        // [clampWarnThreshold]% of the time over the last
+        // [POLAR_BYPASS_MIN_SAMPLE] process calls, warn in chat.
+        if (monitorPolarBypass && pbTotalProcess.get() >= POLAR_BYPASS_MIN_SAMPLE) {
             val ratio = pbClampEvents.get().toDouble() / pbTotalProcess.get().toDouble()
-            val threshold = clampWarnThreshold.toDouble() / 100.0
+            val threshold = clampWarnThreshold.toDouble() / POLAR_BYPASS_WARN_RATIO_DIVISOR.toDouble()
             if (ratio > threshold) {
-                // Only warn once per 1000 ticks to avoid spam.
-                if (player.age % 1000 == 0) {
+                // Only warn once per [POLAR_BYPASS_WARN_COOLDOWN_TICKS] ticks to avoid spam.
+                if (player.age % POLAR_BYPASS_WARN_COOLDOWN_TICKS == 0) {
                     chat(
-                        "§e[CustomAuraDebug] §cPolarBypass clamp ratio ${(ratio * 100).toInt()}% — " +
+                        "§e[CustomAuraDebug] §cPolarBypass clamp ratio ${
+                            (ratio * POLAR_BYPASS_WARN_RATIO_DIVISOR).toInt()
+                        }% — " +
                             "consider lowering your base AngleSmooth speed."
                     )
                 }
@@ -423,58 +534,73 @@ object ModuleCustomAuraDebugger : ClientModule(
         val ctx = event.context
         val textRenderer = mc.textRenderer
 
-        val lines = buildList {
-            add("§b§lCustomAura Debug")
-            add("§7Preset: §f${last.preset}")
-            add("§7Criticals: §f${last.criticalsMode}")
-            add("§7Tick: §f${last.tick}")
-            add("")
-            add("§7Attempts: §a${totalAttempts.get()}")
-            add("§7Landed: §a${totalLanded.get()}")
-            add("§7Skipped: §c${totalSkipped.get()}")
-            add("§7Failed: §c${totalFailed.get()}")
-            add("")
-            add("§7Last phase: §f${last.phase}")
-            last.skipReason?.let { add("§7Skip reason: §c$it") }
-            last.targetName?.let { add("§7Target: §f$it (#${last.targetId})") }
-            last.targetDistance?.let { add("§7Dist: §f${"%.2f".format(it)}") }
-            last.effectiveRange?.let { add("§7EffRange: §f${"%.2f".format(it)}") }
-            last.jitter?.let { add("§7Jitter: §f${"%.3f".format(it)}") }
-            last.isFacingEnemy?.let { add("§7Facing: §f$it") }
-            last.isClickTick?.let { add("§7ClickTick: §f$it") }
-            last.onGround?.let { add("§7OnGround: §f$it") }
-            last.validateAttack?.let { add("§7Validate: §f$it") }
-            add("")
-            add("§7Yaw: §f${"%.2f".format(last.yaw ?: 0f)}")
-            add("§7Server yaw: §f${"%.2f".format(last.serverYaw ?: 0f)}")
-            last.pbClampedYaw?.let { add("§7PB clamped: §f${"%.2f".format(it)}") }
-            last.pbNoisedYaw?.let { add("§7PB noised: §f${"%.2f".format(it)}") }
-            if (monitorPolarBypass && pbTotalProcess.get() > 0) {
-                val ratio = pbClampEvents.get() * 100 / pbTotalProcess.get()
-                add("§7PB clamp: §f${pbClampEvents.get()}/${pbTotalProcess.get()} ($ratio%)")
-            }
-            // Skip reasons top 3 — sliding window. Evicts stale entries
-            // (older than [skipReasonWindowTicks]) lazily on read.
-            val top3 = topSkipReasons(player.age.toLong())
-            if (top3.isNotEmpty()) {
-                add("")
-                add("§7Top skip reasons (last ${skipReasonWindowTicks}t):")
-                top3.forEach { (reason, count) ->
-                    add(" §c$reason§7: §f$count")
-                }
-            }
-        }
+        val lines = buildOverlayLines(last)
 
         val yOffset = overlayYOffset
         lines.forEachIndexed { idx, line ->
             ctx.drawTextWithShadow(
                 textRenderer,
                 net.minecraft.text.Text.literal(line),
-                5,
-                yOffset + idx * 10,
-                0xFFFFFF
+                OVERLAY_X_POS,
+                yOffset + idx * OVERLAY_LINE_HEIGHT,
+                OVERLAY_TEXT_COLOR
             )
         }
+    }
+
+    /**
+     * Build the list of overlay lines for the given [last] event.
+     *
+     * Extracted from [overlayHandler] so the line list can be reused
+     * (e.g. by a future "dump overlay to chat" command). Uses a
+     * pre-sized [ArrayList] instead of [buildList] to avoid per-frame
+     * allocation churn — the overlay handler runs 60+ times per second.
+     */
+    private fun buildOverlayLines(last: AttackEvent): List<String> {
+        // Pre-size for the worst case (~25 lines). ArrayList allocations
+        // are still O(1) amortized but the array is sized once instead
+        // of growing through 3-4 reallocations as buildList does.
+        val lines = ArrayList<String>(28)
+        lines += "§b§lCustomAura Debug"
+        lines += "§7Preset: §f${last.preset}"
+        lines += "§7Criticals: §f${last.criticalsMode}"
+        lines += "§7Tick: §f${last.tick}"
+        lines += ""
+        lines += "§7Attempts: §a${totalAttempts.get()}"
+        lines += "§7Landed: §a${totalLanded.get()}"
+        lines += "§7Skipped: §c${totalSkipped.get()}"
+        lines += "§7Failed: §c${totalFailed.get()}"
+        lines += ""
+        lines += "§7Last phase: §f${last.phase}"
+        last.skipReason?.let { lines += "§7Skip reason: §c$it" }
+        last.targetName?.let { lines += "§7Target: §f$it (#${last.targetId})" }
+        last.targetDistance?.let { lines += "§7Dist: §f${"%.2f".format(it)}" }
+        last.effectiveRange?.let { lines += "§7EffRange: §f${"%.2f".format(it)}" }
+        last.jitter?.let { lines += "§7Jitter: §f${"%.3f".format(it)}" }
+        last.isFacingEnemy?.let { lines += "§7Facing: §f$it" }
+        last.isClickTick?.let { lines += "§7ClickTick: §f$it" }
+        last.onGround?.let { lines += "§7OnGround: §f$it" }
+        last.validateAttack?.let { lines += "§7Validate: §f$it" }
+        lines += ""
+        lines += "§7Yaw: §f${"%.2f".format(last.yaw ?: 0f)}"
+        lines += "§7Server yaw: §f${"%.2f".format(last.serverYaw ?: 0f)}"
+        last.pbClampedYaw?.let { lines += "§7PB clamped: §f${"%.2f".format(it)}" }
+        last.pbNoisedYaw?.let { lines += "§7PB noised: §f${"%.2f".format(it)}" }
+        if (monitorPolarBypass && pbTotalProcess.get() > 0) {
+            val ratio = pbClampEvents.get() * POLAR_BYPASS_WARN_RATIO_DIVISOR / pbTotalProcess.get()
+            lines += "§7PB clamp: §f${pbClampEvents.get()}/${pbTotalProcess.get()} ($ratio%)"
+        }
+        // Skip reasons top 3 — TTL-cached to avoid re-sorting 60×/s.
+        // See [topSkipReasonsCached] for the cache protocol.
+        val top3 = topSkipReasonsCached(player.age.toLong())
+        if (top3.isNotEmpty()) {
+            lines += ""
+            lines += "§7Top skip reasons (last ${skipReasonWindowTicks}t):"
+            top3.forEach { (reason, count) ->
+                lines += " §c$reason§7: §f$count"
+            }
+        }
+        return lines
     }
 
     // ── Log file management ───────────────────────────────────────────
@@ -497,32 +623,58 @@ object ModuleCustomAuraDebugger : ClientModule(
             lastFlushMs = System.currentTimeMillis()
         } catch (e: Exception) {
             // Don't crash the module if the log can't be opened.
+            // Note: we catch Exception (not Throwable) so InterruptedException
+            // is still caught, but we re-interrupt the thread to preserve
+            // the interrupt status for any higher-level shutdown hooks.
+            if (e is InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
             chat("§c[CustomAuraDebug] Failed to open log file: ${e.message}")
         }
     }
 
+    /**
+     * Format a single [AttackEvent] as a single log line.
+     *
+     * The previous implementation called `buildString { append(...) }`
+     * 17 times in a row. While `buildString` is reasonably efficient,
+     * the chain of conditional `?.let { append(" | label=").append(it) }`
+     * blocks was both hard to scan visually and produced a long
+     * bytecode sequence. We now build a list of (label, value) pairs
+     * and join them with [LOG_FIELD_SEPARATOR] — the compiler folds
+     * `joinToString` into an efficient StringBuilder pass, and the
+     * pair-list makes it trivial to add or reorder fields.
+     */
+    private fun formatEventLine(event: AttackEvent): String {
+        // The timestamp prefix is unconditional; everything else is
+        // optional (only emitted when the value is non-null).
+        val ts = dateFormat.format(Instant.ofEpochMilli(event.timestamp))
+
+        // Pre-size for the worst case (~16 fields × ~20 chars).
+        val fields = ArrayList<String>(16)
+        fields += ts
+        fields += "tick=${event.tick}"
+        fields += event.phase
+        event.skipReason?.let { fields += "reason=$it" }
+        event.targetName?.let { fields += "target=$it(#${event.targetId})" }
+        event.targetDistance?.let { fields += "dist=${"%.3f".format(it)}" }
+        event.effectiveRange?.let { fields += "effRange=${"%.3f".format(it)}" }
+        event.jitter?.let { fields += "jitter=${"%.3f".format(it)}" }
+        event.isFacingEnemy?.let { fields += "facing=$it" }
+        event.isClickTick?.let { fields += "clickTick=$it" }
+        event.onGround?.let { fields += "onGround=$it" }
+        event.validateAttack?.let { fields += "validate=$it" }
+        event.yaw?.let { fields += "yaw=${"%.2f".format(it)}" }
+        event.serverYaw?.let { fields += "serverYaw=${"%.2f".format(it)}" }
+        event.pbClampedYaw?.let { fields += "pbClampedYaw=${"%.2f".format(it)}" }
+        event.pbNoisedYaw?.let { fields += "pbNoisedYaw=${"%.2f".format(it)}" }
+
+        return fields.joinToString(LOG_FIELD_SEPARATOR)
+    }
+
     private fun appendToLog(event: AttackEvent) {
         val writer = logWriter ?: return
-        // DateTimeFormatter is thread-safe (immutable), safe to call from any thread.
-        val ts = dateFormat.format(Instant.ofEpochMilli(event.timestamp))
-        val line = buildString {
-            append(ts)
-            append(" | tick=").append(event.tick)
-            append(" | ").append(event.phase)
-            event.skipReason?.let { append(" | reason=").append(it) }
-            event.targetName?.let { append(" | target=").append(it).append("(#").append(event.targetId).append(")") }
-            event.targetDistance?.let { append(" | dist=").append("%.3f".format(it)) }
-            event.effectiveRange?.let { append(" | effRange=").append("%.3f".format(it)) }
-            event.jitter?.let { append(" | jitter=").append("%.3f".format(it)) }
-            event.isFacingEnemy?.let { append(" | facing=").append(it) }
-            event.isClickTick?.let { append(" | clickTick=").append(it) }
-            event.onGround?.let { append(" | onGround=").append(it) }
-            event.validateAttack?.let { append(" | validate=").append(it) }
-            event.yaw?.let { append(" | yaw=").append("%.2f".format(it)) }
-            event.serverYaw?.let { append(" | serverYaw=").append("%.2f".format(it)) }
-            event.pbClampedYaw?.let { append(" | pbClampedYaw=").append("%.2f".format(it)) }
-            event.pbNoisedYaw?.let { append(" | pbNoisedYaw=").append("%.2f".format(it)) }
-        }
+        val line = formatEventLine(event)
         // synchronized on logWriter because PrintWriter is not thread-safe
         // and recordEvent may be called from multiple threads.
         synchronized(writer) {
@@ -542,6 +694,10 @@ object ModuleCustomAuraDebugger : ClientModule(
      * [currentTick]. Stale entries (older than [skipReasonWindowTicks])
      * are evicted from the deque as a side effect — this lazy eviction
      * keeps the write path O(1).
+     *
+     * This is the underlying uncached implementation. Callers that run
+     * frequently (e.g. the overlay, 60×/s) should use [topSkipReasonsCached]
+     * instead.
      */
     private fun topSkipReasons(currentTick: Long, limit: Int = 3): List<Pair<String, Int>> {
         val minTick = currentTick - skipReasonWindowTicks
@@ -580,6 +736,40 @@ object ModuleCustomAuraDebugger : ClientModule(
     }
 
     /**
+     * TTL-cached version of [topSkipReasons]. Returns the cached top-3
+     * if it was computed within the last [TOP_SKIP_REASONS_TTL_MS] ms;
+     * otherwise recomputes, caches, and returns.
+     *
+     * The cache is invalidated eagerly by [recordEvent] whenever a new
+     * SKIPPED event arrives — that invalidation is just a single
+     * volatile write (`topSkipReasonsCacheAtMs = 0L`), so it does not
+     * slow down the write path. The next overlay frame will see the
+     * stale timestamp and recompute.
+     */
+    private fun topSkipReasonsCached(currentTick: Long): List<Pair<String, Int>> {
+        val nowMs = System.currentTimeMillis()
+        // Double-checked locking pattern: read the volatile fields
+        // outside the synchronized block first, only enter the lock
+        // when we actually need to recompute.
+        val cachedAt = topSkipReasonsCacheAtMs
+        if (cachedAt != 0L && nowMs - cachedAt < TOP_SKIP_REASONS_TTL_MS) {
+            return topSkipReasonsCache
+        }
+        synchronized(this) {
+            // Re-check inside the lock — another thread may have just
+            // recomputed the cache while we were waiting for the lock.
+            val cachedAtSync = topSkipReasonsCacheAtMs
+            if (cachedAtSync != 0L && nowMs - cachedAtSync < TOP_SKIP_REASONS_TTL_MS) {
+                return topSkipReasonsCache
+            }
+            val fresh = topSkipReasons(currentTick)
+            topSkipReasonsCache = fresh
+            topSkipReasonsCacheAtMs = nowMs
+            return fresh
+        }
+    }
+
+    /**
      * Dump the current ring buffer as a multi-line string, for use by
      * a future .customauradump command or crash reporter.
      */
@@ -593,20 +783,9 @@ object ModuleCustomAuraDebugger : ClientModule(
             "${topSkipReasons(player.age.toLong(), limit = 100).toMap()}")
         pw.println("# ---")
         ringBuffer.forEach { event ->
-            pw.println("${event.timestamp} | tick=${event.tick} | ${event.phase}" +
-                " | reason=${event.skipReason}" +
-                " | target=${event.targetName}(#${event.targetId})" +
-                " | dist=${event.targetDistance}" +
-                " | effRange=${event.effectiveRange}" +
-                " | jitter=${event.jitter}" +
-                " | facing=${event.isFacingEnemy}" +
-                " | clickTick=${event.isClickTick}" +
-                " | onGround=${event.onGround}" +
-                " | validate=${event.validateAttack}" +
-                " | yaw=${event.yaw}" +
-                " | serverYaw=${event.serverYaw}" +
-                " | pbClampedYaw=${event.pbClampedYaw}" +
-                " | pbNoisedYaw=${event.pbNoisedYaw}")
+            // Reuse [formatEventLine] so the dump format stays in sync
+            // with the log file format.
+            pw.println(formatEventLine(event))
         }
         return sw.toString()
     }

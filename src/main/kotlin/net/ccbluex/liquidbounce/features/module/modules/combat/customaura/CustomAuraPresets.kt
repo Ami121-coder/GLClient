@@ -33,6 +33,29 @@ import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.featur
 import net.ccbluex.liquidbounce.utils.client.ServerObserver
 
 /**
+ * Common range/raycast defaults shared across multiple presets.
+ *
+ * These values are intrinsic to the anticheat-bypass design (e.g.
+ * 4.4 is below vanilla reach 4.5) and would lose meaning if replaced
+ * with a single bare literal in each preset. Extracting them as named
+ * constants also makes future tuning sweeps (e.g. "lower every preset's
+ * range by 0.05") trivially auditable via a one-line diff.
+ */
+private const val SCAN_EXTRA_RANGE_START_DEFAULT = 0.5f
+private const val SCAN_EXTRA_RANGE_END_DEFAULT = 1.0f
+private const val SCAN_EXTRA_RANGE_END_HYPIXEL = 1.5f
+private const val SCAN_EXTRA_RANGE_END_VANILLA = 0.5f
+private const val FAIL_SWING_RANGE_START_DEFAULT = 1.0f
+private const val FAIL_SWING_RANGE_END_DEFAULT = 1.5f
+private const val FAIL_SWING_RANGE_START_VANILLA = 0.5f
+private const val FAIL_SWING_RANGE_END_VANILLA = 1.0f
+private const val FAIL_SWING_INTERVAL_MS_DEFAULT = 200
+private const val FAIL_SWING_INTERVAL_MS_INTAVE = 150
+private const val FAIL_SWING_INTERVAL_MS_VANILLA = 100
+private const val TICK_OFF_ON_ZERO = 0
+private const val TICK_OFF_ON_HYPIXEL_END = 1
+
+/**
  * Presets for [ModuleCustomAura].
  *
  * Each preset is a complete configuration bundle that, when applied,
@@ -152,8 +175,8 @@ object CustomAuraPresets {
             range = 3.8f,
             wallRange = 0f,
             reachJitter = 0.05f,
-            scanExtraRangeStart = 0.5f,
-            scanExtraRangeEnd = 1.0f,
+            scanExtraRangeStart = SCAN_EXTRA_RANGE_START_DEFAULT,
+            scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_DEFAULT,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
             autoJumpForCrits = false,
@@ -170,15 +193,15 @@ object CustomAuraPresets {
             autoBlockEnabled = false,
             blockMode = BlockMode.BASIC,
             unblockMode = UnblockMode.STOP_USING_ITEM,
-            tickOffStart = 0,
-            tickOffEnd = 0,
-            tickOnStart = 0,
-            tickOnEnd = 0,
+            tickOffStart = TICK_OFF_ON_ZERO,
+            tickOffEnd = TICK_OFF_ON_ZERO,
+            tickOnStart = TICK_OFF_ON_ZERO,
+            tickOnEnd = TICK_OFF_ON_ZERO,
 
             failSwingEnabled = true,
-            failSwingAdditionalRangeStart = 1.0f,
-            failSwingAdditionalRangeEnd = 1.5f,
-            failSwingMinIntervalMs = 200,
+            failSwingAdditionalRangeStart = FAIL_SWING_RANGE_START_DEFAULT,
+            failSwingAdditionalRangeEnd = FAIL_SWING_RANGE_END_DEFAULT,
+            failSwingMinIntervalMs = FAIL_SWING_INTERVAL_MS_DEFAULT,
 
             antiCheaterEnabled = true,
             snapThreshold = 60f,
@@ -191,8 +214,8 @@ object CustomAuraPresets {
             range = 3.9f,
             wallRange = 0f,
             reachJitter = 0.04f,
-            scanExtraRangeStart = 0.5f,
-            scanExtraRangeEnd = 1.0f,
+            scanExtraRangeStart = SCAN_EXTRA_RANGE_START_DEFAULT,
+            scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_DEFAULT,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
             autoJumpForCrits = false,
@@ -209,15 +232,15 @@ object CustomAuraPresets {
             autoBlockEnabled = false,
             blockMode = BlockMode.BASIC,
             unblockMode = UnblockMode.STOP_USING_ITEM,
-            tickOffStart = 0,
-            tickOffEnd = 0,
-            tickOnStart = 0,
-            tickOnEnd = 0,
+            tickOffStart = TICK_OFF_ON_ZERO,
+            tickOffEnd = TICK_OFF_ON_ZERO,
+            tickOnStart = TICK_OFF_ON_ZERO,
+            tickOnEnd = TICK_OFF_ON_ZERO,
 
             failSwingEnabled = true,
-            failSwingAdditionalRangeStart = 1.0f,
-            failSwingAdditionalRangeEnd = 1.5f,
-            failSwingMinIntervalMs = 150,
+            failSwingAdditionalRangeStart = FAIL_SWING_RANGE_START_DEFAULT,
+            failSwingAdditionalRangeEnd = FAIL_SWING_RANGE_END_DEFAULT,
+            failSwingMinIntervalMs = FAIL_SWING_INTERVAL_MS_INTAVE,
 
             antiCheaterEnabled = true,
             snapThreshold = 65f,
@@ -230,8 +253,8 @@ object CustomAuraPresets {
             range = 4.0f,
             wallRange = 0f,
             reachJitter = 0.03f,
-            scanExtraRangeStart = 0.5f,
-            scanExtraRangeEnd = 1.5f,
+            scanExtraRangeStart = SCAN_EXTRA_RANGE_START_DEFAULT,
+            scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_HYPIXEL,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.JUMP_ONLY,
             autoJumpForCrits = true,
@@ -248,15 +271,15 @@ object CustomAuraPresets {
             autoBlockEnabled = true,
             blockMode = BlockMode.BASIC,
             unblockMode = UnblockMode.STOP_USING_ITEM,
-            tickOffStart = 0,
-            tickOffEnd = 1,
-            tickOnStart = 0,
-            tickOnEnd = 1,
+            tickOffStart = TICK_OFF_ON_ZERO,
+            tickOffEnd = TICK_OFF_ON_HYPIXEL_END,
+            tickOnStart = TICK_OFF_ON_ZERO,
+            tickOnEnd = TICK_OFF_ON_HYPIXEL_END,
 
             failSwingEnabled = false,
-            failSwingAdditionalRangeStart = 1.0f,
-            failSwingAdditionalRangeEnd = 1.5f,
-            failSwingMinIntervalMs = 200,
+            failSwingAdditionalRangeStart = FAIL_SWING_RANGE_START_DEFAULT,
+            failSwingAdditionalRangeEnd = FAIL_SWING_RANGE_END_DEFAULT,
+            failSwingMinIntervalMs = FAIL_SWING_INTERVAL_MS_DEFAULT,
 
             antiCheaterEnabled = true,
             snapThreshold = 70f,
@@ -270,7 +293,7 @@ object CustomAuraPresets {
             wallRange = 0f,
             reachJitter = 0f,
             scanExtraRangeStart = 0f,
-            scanExtraRangeEnd = 0.5f,
+            scanExtraRangeEnd = SCAN_EXTRA_RANGE_END_VANILLA,
             raycast = RaycastMode.TRACE_ALL,
             criticalsMode = CriticalsMode.NONE,
             autoJumpForCrits = false,
@@ -287,15 +310,15 @@ object CustomAuraPresets {
             autoBlockEnabled = false,
             blockMode = BlockMode.BASIC,
             unblockMode = UnblockMode.STOP_USING_ITEM,
-            tickOffStart = 0,
-            tickOffEnd = 0,
-            tickOnStart = 0,
-            tickOnEnd = 0,
+            tickOffStart = TICK_OFF_ON_ZERO,
+            tickOffEnd = TICK_OFF_ON_ZERO,
+            tickOnStart = TICK_OFF_ON_ZERO,
+            tickOnEnd = TICK_OFF_ON_ZERO,
 
             failSwingEnabled = false,
-            failSwingAdditionalRangeStart = 0.5f,
-            failSwingAdditionalRangeEnd = 1.0f,
-            failSwingMinIntervalMs = 100,
+            failSwingAdditionalRangeStart = FAIL_SWING_RANGE_START_VANILLA,
+            failSwingAdditionalRangeEnd = FAIL_SWING_RANGE_END_VANILLA,
+            failSwingMinIntervalMs = FAIL_SWING_INTERVAL_MS_VANILLA,
 
             antiCheaterEnabled = false,
             snapThreshold = 60f,

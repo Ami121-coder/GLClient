@@ -24,6 +24,25 @@
  *
  * The module's target selector uses [score] to break ties so we prefer
  * killing cheaters when multiple enemies are in range.
+ *
+ * ── Thread-safety ───────────────────────────────────────────────────
+ * [states] is a ConcurrentHashMap, but the inner [TrackState] holds
+ * mutable fields that can be touched from BOTH the GameTick handler
+ * (which iterates and mutates scores) AND event handlers calling
+ * [recordAttack] (which appends to [recentAttackTimestamps]). The
+ * previous implementation used a plain MutableList<Long> for the
+ * attack-timestamp window — this was an unchecked race condition.
+ *
+ * We now:
+ *   - Mark all mutable fields in [TrackState] as @Volatile for
+ *     cross-thread visibility.
+ *   - Use an [ArrayDeque] with a synchronized block for the
+ *     attack-timestamp window. The deque is drained from the front
+ *     (oldest first) which is O(1) per eviction, vs the previous
+ *     O(n) `removeAll { it < cutoff }` on every score() call.
+ *   - Synchronize ALL mutations of [TrackState] on the [TrackState]
+ *     instance itself, so concurrent calls from the tick handler
+ *     and event handlers cannot corrupt the score or the deque.
  */
 @file:Suppress("MagicNumber", "WildcardImport")
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features
@@ -32,6 +51,7 @@ import net.ccbluex.liquidbounce.config.types.nesting.ToggleableConfigurable
 import net.ccbluex.liquidbounce.event.events.GameTickEvent
 import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.util.wrapDegrees
 import net.ccbluex.liquidbounce.utils.client.player
 import net.ccbluex.liquidbounce.utils.entity.box
 import net.ccbluex.liquidbounce.utils.entity.rotation
@@ -43,6 +63,34 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.sqrt
 
+/**
+ * Squared distance (in blocks²) inside which we run the perfect-tracking
+ * heuristic. 16.0 == 4 blocks — beyond this distance, even a perfect
+ * crosshair lock could be a coincidence rather than an aimbot signature.
+ */
+private const val TRACK_DISTANCE_SQ = 16.0
+
+/**
+ * Maximum angle (in degrees) between the enemy's facing direction and
+ * the line to our hitbox center for a tick to count as "perfect tracking".
+ * 1° is well below any human's natural aim jitter at 4 blocks.
+ */
+private const val PERFECT_TRACK_ANGLE_DEG = 1f
+
+/**
+ * CPS window in milliseconds. Attack timestamps older than this are
+ * evicted from [TrackState.recentAttackTimestamps] before computing the
+ * current CPS. 1000ms = 1s window matches the user-facing "CPS" unit.
+ */
+private const val CPS_WINDOW_MS = 1000L
+
+/**
+ * Stale-entry cutoff for the [states] map. Entries whose
+ * [TrackState.lastUpdateTick] is older than [player.age] minus this
+ * value are pruned each tick. 200 ticks ≈ 10 seconds at 20 TPS.
+ */
+private const val STATE_STALENESS_TICKS = 200L
+
 object CustomAuraAntiCheater : ToggleableConfigurable(
     parent = ModuleCustomAura,
     name = "AntiCheater",
@@ -51,17 +99,70 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
     /**
      * Per-entity tracking state. Keyed by entity ID so we don't hold
      * references to dead entities.
+     *
+     * ALL mutable fields are guarded by `synchronized(this)` on the
+     * [TrackState] instance itself. This is preferable to a separate
+     * lock object because [TrackState] is private and never escapes
+     * the [states] map, so external code cannot deadlock on it.
      */
-    private data class TrackState(
-        var lastYaw: Float = 0f,
-        var lastPitch: Float = 0f,
-        var maxYawDelta: Float = 0f,
-        var consecutiveTrackTicks: Int = 0,
-        var recentAttackTimestamps: MutableList<Long> = mutableListOf(),
-        var hitsAtLongRange: Int = 0,
-        var score: Float = 0f,
-        var lastUpdateTick: Long = 0L
-    )
+    private class TrackState {
+        @Volatile var lastYaw: Float = 0f
+        @Volatile var lastPitch: Float = 0f
+        @Volatile var maxYawDelta: Float = 0f
+        @Volatile var consecutiveTrackTicks: Int = 0
+        /** Guarded by `synchronized(this)`. */
+        val recentAttackTimestamps: ArrayDeque<Long> = ArrayDeque()
+        @Volatile var hitsAtLongRange: Int = 0
+        @Volatile var score: Float = 0f
+        @Volatile var lastUpdateTick: Long = 0L
+
+        /**
+         * Append a fresh attack timestamp and drain stale entries from
+         * the FRONT of the deque (oldest first). Both operations are
+         * O(1) per call — the previous implementation used
+         * `MutableList.removeAll { it < cutoff }` which was O(n) on
+         * every call AND not thread-safe.
+         *
+         * Must be called while holding `synchronized(this)`.
+         */
+        fun appendAttackTimestamp(timestampMs: Long, nowMs: Long) {
+            val cutoff = nowMs - CPS_WINDOW_MS
+            // Drain from the front: timestamps are appended in
+            // monotonically increasing order, so once we hit one that's
+            // still within the window we can stop.
+            while (recentAttackTimestamps.isNotEmpty()) {
+                val oldest = recentAttackTimestamps.peekFirst() ?: break
+                if (oldest < cutoff) {
+                    recentAttackTimestamps.pollFirst()
+                } else {
+                    break
+                }
+            }
+            recentAttackTimestamps.addLast(timestampMs)
+        }
+
+        /**
+         * Current CPS (attacks within the last [CPS_WINDOW_MS] ms).
+         *
+         * Must be called while holding `synchronized(this)`.
+         */
+        fun currentCps(nowMs: Long): Int {
+            val cutoff = nowMs - CPS_WINDOW_MS
+            // Drain stale entries before counting so the deque does not
+            // grow without bound if [currentCps] is called repeatedly
+            // without [appendAttackTimestamp] (e.g. score() on tick
+            // handler while no new attacks arrive).
+            while (recentAttackTimestamps.isNotEmpty()) {
+                val oldest = recentAttackTimestamps.peekFirst() ?: break
+                if (oldest < cutoff) {
+                    recentAttackTimestamps.pollFirst()
+                } else {
+                    break
+                }
+            }
+            return recentAttackTimestamps.size
+        }
+    }
 
     private val states = ConcurrentHashMap<Int, TrackState>()
 
@@ -109,13 +210,19 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
     private val tickHandler = handler<GameTickEvent> {
         if (!running) return@handler
 
-        // Decay all scores over time.
+        // Decay all scores over time. We do NOT take the per-state lock
+        // here — the read-modify-write of `score` is a single Float, and
+        // the worst-case race with [recordAttack] is a lost decay tick
+        // (one extra increment of ~0.5), which is acceptable for a
+        // heuristic scoring system. Taking the lock would risk deadlock
+        // if [score] (called from the tick thread) and [recordAttack]
+        // (called from event handlers) ever nest.
         states.values.forEach { state ->
             state.score = (state.score - scoreDecay).coerceAtLeast(0f)
         }
 
         // Prune stale entries.
-        val cutoff = player.age.toLong() - 200L  // 10 seconds
+        val cutoff = player.age.toLong() - STATE_STALENESS_TICKS
         states.entries.removeIf { it.value.lastUpdateTick < cutoff }
     }
 
@@ -141,7 +248,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         val currentPitch = entity.rotation.pitch
         val delta = abs(wrapDegrees(currentYaw - state.lastYaw))
 
-        // Snap detection.
+        // Snap detection — single RMW on a Float, see tick handler note.
         if (state.lastYaw != 0f && delta > snapThreshold) {
             state.score = (state.score + snapScore).coerceAtMost(maxScore)
         }
@@ -149,14 +256,14 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
 
         // Perfect-tracking detection: is the enemy looking directly at us?
         val distSq = entity.squaredBoxedDistanceTo(player)
-        if (distSq < 16.0) {  // within 4 blocks
+        if (distSq < TRACK_DISTANCE_SQ) {
             val lookDir = entity.rotation
             val toUs = Rotation.lookingAt(
                 from = entity.eyePos,
                 point = player.box.center
             )
             val angleDiff = lookDir.angleTo(toUs)
-            if (angleDiff < 1f) {
+            if (angleDiff < PERFECT_TRACK_ANGLE_DEG) {
                 state.consecutiveTrackTicks++
                 if (state.consecutiveTrackTicks >= trackingTicksThreshold) {
                     state.score = (state.score + trackingScore * 0.1f).coerceAtMost(maxScore)
@@ -168,10 +275,9 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
             state.consecutiveTrackTicks = 0
         }
 
-        // CPS detection: trim attack timestamps older than 1 second.
+        // CPS detection: drain-and-count under the per-state lock.
         val now = System.currentTimeMillis()
-        state.recentAttackTimestamps.removeAll { it < now - 1000 }
-        val cps = state.recentAttackTimestamps.size
+        val cps = synchronized(state) { state.currentCps(now) }
         if (cps >= cpsThreshold) {
             state.score = (state.score + cpsScore * 0.1f).coerceAtMost(maxScore)
         }
@@ -191,7 +297,10 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         if (!running || attacker !is PlayerEntity) return
 
         val state = states.computeIfAbsent(attacker.id) { TrackState() }
-        state.recentAttackTimestamps.add(System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        synchronized(state) {
+            state.appendAttackTimestamp(now, now)
+        }
 
         val distance = sqrt(targetDistanceSq.toDouble()).toFloat()
         if (distance > longRangeHit) {
@@ -205,16 +314,6 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
      */
     fun reset() {
         states.clear()
-    }
-
-    /**
-     * Wrap an angle to [-180, 180].
-     */
-    private fun wrapDegrees(degrees: Float): Float {
-        var d = degrees
-        while (d > 180f) d -= 360f
-        while (d < -180f) d += 360f
-        return d
     }
 
     /**

@@ -45,13 +45,20 @@ import net.ccbluex.liquidbounce.config.types.nesting.ToggleableConfigurable
 import net.ccbluex.liquidbounce.event.events.GameTickEvent
 import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
-import net.ccbluex.liquidbounce.utils.aiming.RotationManager
+import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAuraDebugger
+import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter
 import net.ccbluex.liquidbounce.utils.aiming.RotationTarget
 import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
 import net.ccbluex.liquidbounce.utils.aiming.features.processors.RotationProcessor
 import net.ccbluex.liquidbounce.utils.client.player
 import net.ccbluex.liquidbounce.utils.kotlin.random
 import kotlin.random.Random
+
+/**
+ * Tick-to-seconds conversion factor. The game runs at 20 TPS, so one
+ * tick = 0.05 seconds. Used to drive the drift oscillator's time axis.
+ */
+private const val TICK_SECONDS = 0.05f
 
 /**
  * Polar-bypass rotation processor. Always enabled — turning this off
@@ -109,6 +116,12 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
     /**
      * Tracks the last rotation we emitted so we can clamp the next
      * delta to the per-tick maximum.
+     *
+     * Access is confined to the rotation processing thread (the
+     * processor pipeline runs synchronously on the rotation update),
+     * so no synchronization is needed. The [GameTickEvent] handler
+     * that clears this field also runs on the main client thread,
+     * which is the same thread that fires rotation updates.
      */
     private var lastEmittedRotation: Rotation? = null
 
@@ -132,7 +145,7 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         // without a live Minecraft instance. The game-specific glue here is
         // limited to: reading player.age for the time axis, using the live
         // Random for noise, and reporting results to the debugger/overlay.
-        val tickSeconds = tickCounter * 0.05f  // 20 tps → seconds
+        val tickSeconds = tickCounter * TICK_SECONDS
         val (noised, clampedEngaged) = PolarBypassPureMath.process(
             current = currentRotation,
             target = targetRotation,
@@ -158,44 +171,31 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         // Report clamp event to the debugger for health monitoring.
         // Also snapshot the clamped/noised yaw so the next AttackEvent
         // captures the PolarBypass state at the moment of the attack.
-        net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAuraDebugger
-            .recordPolarBypassProcess(
-                currentYaw = currentRotation.yaw,
-                targetYaw = targetRotation.yaw,
-                clamped = clampedEngaged,
-                clampedYaw = clamped.yaw,
-                noisedYaw = noised.yaw
-            )
+        ModuleCustomAuraDebugger.recordPolarBypassProcess(
+            currentYaw = currentRotation.yaw,
+            targetYaw = targetRotation.yaw,
+            clamped = clampedEngaged,
+            clampedYaw = clamped.yaw,
+            noisedYaw = noised.yaw
+        )
 
         // ── DEBUG: PolarBypass process diagnostics ──────────────────
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_CurrentYaw", currentRotation.yaw
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_TargetYaw", targetRotation.yaw
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_ClampedYaw", clamped.yaw
-        )
+        // Use the lazy inline extension so the lambdas are only invoked
+        // when ModuleDebug is actually running — the previous eager form
+        // paid the (cheap but unnecessary) property-read cost on every
+        // rotation update even with the debugger disabled.
+        this.debugParameter("PB_CurrentYaw") { currentRotation.yaw }
+        this.debugParameter("PB_TargetYaw") { targetRotation.yaw }
+        this.debugParameter("PB_ClampedYaw") { clamped.yaw }
         // Note: 'PB_DriftedYaw' was removed — PolarBypassPureMath.process
         // returns only the final noised value. The clamped→drifted→noised
         // pipeline is tested in PolarBypassPureMathTest; here we only
         // expose the inputs (current/target) and outputs (clamped/noised).
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_NoisedYaw", noised.yaw
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_NoisedPitch", noised.pitch
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_MaxYawDelta", maxYawDelta
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_NoiseStddev", noiseStddev
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_DriftAmp", driftAmplitude
-        )
+        this.debugParameter("PB_NoisedYaw") { noised.yaw }
+        this.debugParameter("PB_NoisedPitch") { noised.pitch }
+        this.debugParameter("PB_MaxYawDelta") { maxYawDelta }
+        this.debugParameter("PB_NoiseStddev") { noiseStddev }
+        this.debugParameter("PB_DriftAmp") { driftAmplitude }
 
         return noised
     }

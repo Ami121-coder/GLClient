@@ -30,6 +30,7 @@ import net.ccbluex.liquidbounce.config.types.nesting.ToggleableConfigurable
 import net.ccbluex.liquidbounce.event.events.GameTickEvent
 import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
+import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter
 import net.ccbluex.liquidbounce.utils.client.mc
 import net.ccbluex.liquidbounce.utils.client.player
 import net.ccbluex.liquidbounce.utils.client.world
@@ -90,14 +91,24 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     /**
      * Visual blocking state — when true, the client renders the
      * blocking animation without us actually blocking.
+     *
+     * @Volatile because it is read from the render thread (which draws
+     * the block animation) and written from the tick thread (which
+     * starts/stops blocking). The previous implementation was a plain
+     * `var` — a torn read on the render thread could flicker the block
+     * animation for one frame.
      */
+    @Volatile
     var blockVisual: Boolean = false
         private set
 
     /**
      * True when we have actually sent a use-item packet and the server
      * considers us blocking.
+     *
+     * @Volatile — same rationale as [blockVisual].
      */
+    @Volatile
     var blockingStateEnforced: Boolean = false
         private set
 
@@ -119,48 +130,45 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     }
 
     /**
-     * Make the client render the blocking animation without sending
-     * any packet. Safe to call every tick.
+     * Set the visual block animation state without sending any packet.
+     * Safe to call every tick.
+     *
+     * Renamed from [makeSeemBlock] for clarity — the previous name was
+     * too colloquial. The old name is kept as a deprecated alias so
+     * existing call sites in [ModuleCustomAura] and [CustomAuraFailSwing]
+     * continue to compile during the rename rollout.
      */
-    fun makeSeemBlock() {
+    fun setVisualBlockState() {
         if (!enabled) return
         blockVisual = true
     }
 
+    /** @deprecated Use [setVisualBlockState]. */
+    fun makeSeemBlock() = setVisualBlockState()
+
     /**
      * Start blocking. Sends AT MOST ONE interactItem packet per block
      * session — no Hypixel-style spam.
+     *
+     * Debug diagnostics for the skip-reason tree are coalesced into a
+     * single [emitStartBlockingDebug] helper so the main control flow
+     * reads cleanly without a forest of `debugParameter` calls. The
+     * helper uses the lazy inline extension so the lambdas are only
+     * evaluated when the debugger is actually running.
      */
     fun startBlocking() {
-        // ── DEBUG: AutoBlock entry ────────────────────────────────────
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_Enabled", enabled
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_BlockMode", blockMode.name
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_UnblockMode", unblockMode.name
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_BlockingEnforced", blockingStateEnforced
-        )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_IsBlockAction", player.isBlockAction
-        )
+        // Always emit the entry-state diagnostics — these are cheap and
+        // help trace the decision tree when debugging.
+        emitStartBlockingDebug()
 
         if (!enabled || (player.isBlockAction && blockMode == BlockMode.BASIC)) {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "AB_SkipReason", "already_blocking_or_disabled"
-            )
+            this.debugParameter("AB_SkipReason") { "already_blocking_or_disabled" }
             return
         }
 
         if (blockMode == BlockMode.FAKE) {
             blockVisual = true
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "AB_SkipReason", "fake_mode_visual_only"
-            )
+            this.debugParameter("AB_SkipReason") { "fake_mode_visual_only" }
             return
         }
 
@@ -168,29 +176,22 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
             canBlock(player.mainHandStack) -> Hand.MAIN_HAND
             canBlock(player.offHandStack) -> Hand.OFF_HAND
             else -> {
-                net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                    this, "AB_SkipReason", "no_blockable_hand"
-                )
+                this.debugParameter("AB_SkipReason") { "no_blockable_hand" }
                 return
             }
         }
 
         val itemStack = player.getStackInHand(blockHand)
         if (itemStack.isEmpty || !itemStack.isItemEnabled(world.enabledFeatures)) {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "AB_SkipReason", "item_empty_or_disabled"
-            )
+            this.debugParameter("AB_SkipReason") { "item_empty_or_disabled" }
             return
         }
 
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_BlockHand", blockHand.name
-        )
+        this.debugParameter("AB_BlockHand") { blockHand.name }
 
-        val actionResult = mc.interactionManager?.interactItem(player, blockHand) ?: run {
-            net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-                this, "AB_SkipReason", "interaction_manager_null"
-            )
+        val actionResult = mc.interactionManager?.interactItem(player, blockHand)
+        if (actionResult == null) {
+            this.debugParameter("AB_SkipReason") { "interaction_manager_null" }
             return
         }
 
@@ -201,9 +202,21 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
 
         blockVisual = true
         blockingStateEnforced = true
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "AB_StartedBlocking", true
-        )
+        this.debugParameter("AB_StartedBlocking") { true }
+    }
+
+    /**
+     * Emit the entry-state diagnostics for [startBlocking]. Kept as a
+     * separate helper so the main control flow in [startBlocking] is
+     * readable — without it, the function had six `debugParameter`
+     * calls in a row before any actual logic.
+     */
+    private fun emitStartBlockingDebug() {
+        this.debugParameter("AB_Enabled") { enabled }
+        this.debugParameter("AB_BlockMode") { blockMode.name }
+        this.debugParameter("AB_UnblockMode") { unblockMode.name }
+        this.debugParameter("AB_BlockingEnforced") { blockingStateEnforced }
+        this.debugParameter("AB_IsBlockAction") { player.isBlockAction }
     }
 
     /**

@@ -35,7 +35,7 @@ import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.featur
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAutoBlock
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraFailSwing
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraPolarBypass
-import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug
+import net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter
 import net.ccbluex.liquidbounce.render.renderEnvironmentForWorld
 import net.ccbluex.liquidbounce.utils.aiming.RotationManager
 import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
@@ -59,6 +59,28 @@ import net.minecraft.client.util.math.MatrixStack
 import net.minecraft.entity.Entity
 import net.minecraft.entity.LivingEntity
 import kotlin.math.pow
+import kotlin.random.Random
+
+/**
+ * Minimum effective range (in blocks) after applying reach jitter.
+ * 2.5 is well above the typical "too close to hit" threshold and
+ * prevents the jitter from accidentally shrinking the range to a
+ * value that would make Polar suspect a reach-consistency check.
+ */
+private const val EFFECTIVE_RANGE_MIN = 2.5f
+
+/**
+ * Maximum effective range (in blocks) after applying reach jitter.
+ * 4.4 is below vanilla 4.5 so we never trip the vanilla Reach check.
+ */
+private const val EFFECTIVE_RANGE_MAX = 4.4f
+
+/**
+ * Minimum delay (in milliseconds) between two auto-jumps triggered by
+ * [autoJumpForCrits]. 600ms ≈ 12 ticks at 20 TPS — long enough that
+ * Polar's jump-pattern correlation check never sees a periodic signal.
+ */
+private const val AUTO_JUMP_RATE_LIMIT_MS = 600L
 
 /**
  * CustomAura — Polar-bypass KillAura with anti-cheater prioritization.
@@ -211,14 +233,16 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         val params = CustomAuraPresets.paramsFor(resolved)
 
         // ── DEBUG: preset application ────────────────────────────────
-        ModuleDebug.debugParameter(this, "PresetRequested", p.name)
-        ModuleDebug.debugParameter(this, "PresetResolved", resolved.name)
-        ModuleDebug.debugParameter(this, "PresetRange", params.range)
-        ModuleDebug.debugParameter(this, "PresetWallRange", params.wallRange)
-        ModuleDebug.debugParameter(this, "PresetPolarBypass", params.polarBypassEnabled)
-        ModuleDebug.debugParameter(this, "PresetAutoBlock", params.autoBlockEnabled)
-        ModuleDebug.debugParameter(this, "PresetFailSwing", params.failSwingEnabled)
-        ModuleDebug.debugParameter(this, "PresetAntiCheater", params.antiCheaterEnabled)
+        // Use the lazy inline extension so the value lambdas are only
+        // invoked when ModuleDebug is actually running.
+        this.debugParameter("PresetRequested") { p.name }
+        this.debugParameter("PresetResolved") { resolved.name }
+        this.debugParameter("PresetRange") { params.range }
+        this.debugParameter("PresetWallRange") { params.wallRange }
+        this.debugParameter("PresetPolarBypass") { params.polarBypassEnabled }
+        this.debugParameter("PresetAutoBlock") { params.autoBlockEnabled }
+        this.debugParameter("PresetFailSwing") { params.failSwingEnabled }
+        this.debugParameter("PresetAntiCheater") { params.antiCheaterEnabled }
 
         // ── Main module settings ─────────────────────────────────────
         range = params.range
@@ -308,7 +332,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         if (target == null) {
             CustomAuraAutoBlock.stopBlocking()
             if (CustomAuraFailSwing.enabled && requirementsMet) {
-                CustomAuraFailSwing.dealWithFakeSwing(this, null)
+                CustomAuraFailSwing.performFailSwing(this, null)
             }
             return@tickHandler
         }
@@ -386,11 +410,14 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      */
     @Suppress("CognitiveComplexMethod")
     private suspend fun attackTarget(sequence: Sequence, target: Entity, rotation: Rotation) {
-        CustomAuraAutoBlock.makeSeemBlock()
+        CustomAuraAutoBlock.setVisualBlockState()
 
         // Apply per-tick reach jitter so the strike distance is noisy.
-        val jitter = ((Math.random() * 2.0 - 1.0) * reachJitter.toDouble()).toFloat()
-        val effectiveRange = (range + jitter).coerceIn(2.5f, 4.4f)
+        // Use kotlin.random.Random (not Math.random) for cross-platform
+        // determinism in tests, and to avoid the unnecessary Double→Float
+        // round-trip of the previous implementation.
+        val jitter = reachJitter * (Random.nextFloat() * 2f - 1f)
+        val effectiveRange = (range + jitter).coerceIn(EFFECTIVE_RANGE_MIN, EFFECTIVE_RANGE_MAX)
 
         val isFacingEnemy = facingEnemy(
             toEntity = target, rotation = rotation,
@@ -399,17 +426,17 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         )
 
         // ── DEBUG: attackTarget diagnostics ─────────────────────────
-        ModuleDebug.debugParameter(this, "Target", target.nameForScoreboard)
-        ModuleDebug.debugParameter(this, "Rotation", rotation)
-        ModuleDebug.debugParameter(this, "EffectiveRange", effectiveRange)
-        ModuleDebug.debugParameter(this, "Jitter", jitter)
-        ModuleDebug.debugParameter(this, "IsFacingEnemy", isFacingEnemy)
-        ModuleDebug.debugParameter(this, "IsClickTick", clickScheduler.isClickTick)
-        ModuleDebug.debugParameter(this, "Preset", preset.name)
-        ModuleDebug.debugParameter(this, "CriticalsMode", criticalsMode.name)
-        ModuleDebug.debugParameter(this, "OnGround", player.isOnGround)
-        ModuleDebug.debugParameter(this, "RequirementsMet", requirementsMet)
-        ModuleDebug.debugParameter(this, "ValidateAttack", validateAttack(target))
+        this.debugParameter("Target") { target.nameForScoreboard }
+        this.debugParameter("Rotation") { rotation }
+        this.debugParameter("EffectiveRange") { effectiveRange }
+        this.debugParameter("Jitter") { jitter }
+        this.debugParameter("IsFacingEnemy") { isFacingEnemy }
+        this.debugParameter("IsClickTick") { clickScheduler.isClickTick }
+        this.debugParameter("Preset") { preset.name }
+        this.debugParameter("CriticalsMode") { criticalsMode.name }
+        this.debugParameter("OnGround") { player.isOnGround }
+        this.debugParameter("RequirementsMet") { requirementsMet }
+        this.debugParameter("ValidateAttack") { validateAttack(target) }
 
         if (!isFacingEnemy) {
             // Only block on scan range if AutoBlock is enabled AND enemy is
@@ -436,7 +463,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             CustomAuraAutoBlock.stopBlocking()
 
             if (CustomAuraFailSwing.enabled) {
-                CustomAuraFailSwing.dealWithFakeSwing(sequence, target)
+                CustomAuraFailSwing.performFailSwing(sequence, target)
             }
             ModuleCustomAuraDebugger.recordEvent(
                 phase = "SKIPPED",
@@ -486,7 +513,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             if (autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
                 player.isOnGround && targetTracker.target != null) {
                 val now = System.currentTimeMillis()
-                if (now - lastAutoJumpMs >= 600L) {
+                if (now - lastAutoJumpMs >= AUTO_JUMP_RATE_LIMIT_MS) {
                     pendingAutoJump = true
                     lastAutoJumpMs = now
                 }
@@ -581,21 +608,21 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         val target = candidates.firstOrNull { processTarget(it, maximumRange, situation) }
 
         // ── DEBUG: updateTarget diagnostics ──────────────────────────
-        ModuleDebug.debugParameter(this, "AimSituation", situation.name)
-        ModuleDebug.debugParameter(this, "MaximumRange", maximumRange)
-        ModuleDebug.debugParameter(this, "Range", range)
-        ModuleDebug.debugParameter(this, "Candidates", candidates.size)
-        ModuleDebug.debugParameter(this, "ClosestEnemyDist", targetTracker.closestSquaredEnemyDistance)
+        this.debugParameter("AimSituation") { situation.name }
+        this.debugParameter("MaximumRange") { maximumRange }
+        this.debugParameter("Range") { range }
+        this.debugParameter("Candidates") { candidates.size }
+        this.debugParameter("ClosestEnemyDist") { targetTracker.closestSquaredEnemyDistance }
 
         if (target != null) {
             targetTracker.target = target
-            ModuleDebug.debugParameter(this, "TargetID", target.id)
-            ModuleDebug.debugParameter(this, "TargetScore", antiCheater.score(target))
-            ModuleDebug.debugParameter(this, "TargetDist", target.squaredBoxedDistanceTo(player))
+            this.debugParameter("TargetID") { target.id }
+            this.debugParameter("TargetScore") { antiCheater.score(target) }
+            this.debugParameter("TargetDist") { target.squaredBoxedDistanceTo(player) }
         } else {
             targetTracker.reset()
-            ModuleDebug.debugParameter(this, "TargetID", "none")
-            ModuleDebug.debugParameter(this, "TargetScore", 0f)
+            this.debugParameter("TargetID") { "none" }
+            this.debugParameter("TargetScore") { 0f }
         }
     }
 

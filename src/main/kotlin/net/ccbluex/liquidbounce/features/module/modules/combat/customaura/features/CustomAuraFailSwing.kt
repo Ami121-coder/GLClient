@@ -68,8 +68,12 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
     /**
      * Public entry — called by the main module when the aura has a target
      * but cannot land a hit on it this tick.
+     *
+     * Renamed from [dealWithFakeSwing] for clarity — the old name was
+     * too colloquial. The old name is kept as a deprecated alias so
+     * existing call sites continue to compile during the rename rollout.
      */
-    suspend fun dealWithFakeSwing(sequence: Sequence, target: Entity?) {
+    suspend fun performFailSwing(sequence: Sequence, target: Entity?) {
         if (!enabled || !ModuleCustomAura.validateAttack()) return
 
         // Rate-limit.
@@ -87,8 +91,8 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
             return
         }
 
-        // Make it seem like we are blocking (visual only).
-        CustomAuraAutoBlock.makeSeemBlock()
+        // Set the visual block state (render thread reads blockVisual).
+        CustomAuraAutoBlock.setVisualBlockState()
 
         CustomAuraClicker.attack(sequence) {
             // Honor vanilla attack cooldown.
@@ -99,6 +103,10 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
             true
         }
     }
+
+    /** @deprecated Use [performFailSwing]. */
+    suspend fun dealWithFakeSwing(sequence: Sequence, target: Entity?) =
+        performFailSwing(sequence, target)
 
     /**
      * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
