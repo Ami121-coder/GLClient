@@ -57,6 +57,7 @@ import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.ModuleCustomAura
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.util.wrapDegrees
 import net.ccbluex.liquidbounce.utils.client.player
+import net.ccbluex.liquidbounce.utils.client.world
 import net.ccbluex.liquidbounce.utils.entity.box
 import net.ccbluex.liquidbounce.utils.entity.rotation
 import net.ccbluex.liquidbounce.utils.entity.squaredBoxedDistanceTo
@@ -269,7 +270,7 @@ object CustomAuraAntiCheater : ToggleableConfigurable(
         val maxDistSq = (longRangeHit * longRangeHit).toDouble()
         var nearestAttacker: PlayerEntity? = null
         var nearestDistSq = Double.MAX_VALUE
-        for (entity in player.world.getEntities()) {
+        for (entity in world.entities) {
             if (entity == player) continue
             if (entity !is PlayerEntity) continue
             if (entity.isSpectator || entity.isDead) continue

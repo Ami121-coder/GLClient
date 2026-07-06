@@ -119,9 +119,23 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         // `min(v, range)` AND additionally cap to the setting's own upper
         // bound (3.0) so the invariant `wallRange <= min(range, 3.0)` always
         // holds.
-        val clamped: Float = v.coerceAtMost(range).coerceAtMost(3f)
+        //
+        // Note: `range` is read via a local helper with an explicit Float
+        // return type to break the recursive type-inference cycle that
+        // occurs when both `range` and `wallRange` are initialized as
+        // sibling delegated properties in the same class init block.
+        val rangeValue: Float = currentRange()
+        val clamped: Float = v.coerceAtMost(rangeValue).coerceAtMost(3f)
         if (clamped != v) clamped else v
     }
+
+    /**
+     * Helper used by [wallRange]'s onChange lambda to read [range] with an
+     * explicitly-typed return, breaking the recursive type inference that
+     * Kotlin otherwise hits when both delegated properties are being
+     * initialized at the same time.
+     */
+    private fun currentRange(): Float = range
 
     /**
      * Per-attack reach jitter — adds up to ±0.05 blocks of randomization
