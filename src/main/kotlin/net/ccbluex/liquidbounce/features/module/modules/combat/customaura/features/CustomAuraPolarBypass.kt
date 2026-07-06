@@ -177,9 +177,10 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
             this, "PB_ClampedYaw", clamped.yaw
         )
-        net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
-            this, "PB_DriftedYaw", drifted.yaw
-        )
+        // Note: 'PB_DriftedYaw' was removed — PolarBypassPureMath.process
+        // returns only the final noised value. The clamped→drifted→noised
+        // pipeline is tested in PolarBypassPureMathTest; here we only
+        // expose the inputs (current/target) and outputs (clamped/noised).
         net.ccbluex.liquidbounce.features.module.modules.render.ModuleDebug.debugParameter(
             this, "PB_NoisedYaw", noised.yaw
         )

@@ -455,7 +455,7 @@ object ModuleCustomAuraDebugger : ClientModule(
             }
             // Skip reasons top 3 — sliding window. Evicts stale entries
             // (older than [skipReasonWindowTicks]) lazily on read.
-            val top3 = topSkipReasons(player.age)
+            val top3 = topSkipReasons(player.age.toLong())
             if (top3.isNotEmpty()) {
                 add("")
                 add("§7Top skip reasons (last ${skipReasonWindowTicks}t):")
@@ -590,7 +590,7 @@ object ModuleCustomAuraDebugger : ClientModule(
         pw.println("# Total attempts: ${totalAttempts.get()}, landed: ${totalLanded.get()}, " +
             "skipped: ${totalSkipped.get()}, failed: ${totalFailed.get()}")
         pw.println("# Skip reasons (sliding window, last ${skipReasonWindowTicks}t): " +
-            "${topSkipReasons(player.age, limit = 100).toMap()}")
+            "${topSkipReasons(player.age.toLong(), limit = 100).toMap()}")
         pw.println("# ---")
         ringBuffer.forEach { event ->
             pw.println("${event.timestamp} | tick=${event.tick} | ${event.phase}" +
