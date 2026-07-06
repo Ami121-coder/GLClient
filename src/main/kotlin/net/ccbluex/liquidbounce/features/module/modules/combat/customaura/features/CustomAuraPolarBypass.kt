@@ -51,10 +51,6 @@ import net.ccbluex.liquidbounce.utils.aiming.data.Rotation
 import net.ccbluex.liquidbounce.utils.aiming.features.processors.RotationProcessor
 import net.ccbluex.liquidbounce.utils.client.player
 import net.ccbluex.liquidbounce.utils.kotlin.random
-import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.min
-import kotlin.math.sin
 import kotlin.random.Random
 
 /**
@@ -132,21 +128,29 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
     ): Rotation {
         if (!running) return targetRotation
 
-        // Step 1: clamp the delta from current → target to the per-tick max.
-        val clamped = clampDelta(currentRotation, targetRotation)
-        // Accurately detect if the clamp actually engaged by checking the
-        // raw delta vs the threshold. Comparing clamped != targetRotation
-        // is unreliable due to float arithmetic noise — a delta just under
-        // the threshold can still produce a slightly different clamped value.
-        val yawDelta = abs(wrapDegrees(targetRotation.yaw - currentRotation.yaw))
-        val pitchDelta = abs(targetRotation.pitch - currentRotation.pitch)
-        val clampedEngaged = yawDelta > maxYawDelta || pitchDelta > maxPitchDelta
+        // Delegate the math to [PolarBypassPureMath] so it can be unit-tested
+        // without a live Minecraft instance. The game-specific glue here is
+        // limited to: reading player.age for the time axis, using the live
+        // Random for noise, and reporting results to the debugger/overlay.
+        val tickSeconds = tickCounter * 0.05f  // 20 tps → seconds
+        val (noised, clampedEngaged) = PolarBypassPureMath.process(
+            current = currentRotation,
+            target = targetRotation,
+            tickSeconds = tickSeconds,
+            maxYawDelta = maxYawDelta,
+            maxPitchDelta = maxPitchDelta,
+            noiseStddev = noiseStddev,
+            driftAmplitude = driftAmplitude,
+            driftFrequency = driftFrequency,
+            random = Random
+        )
 
-        // Step 2: add sinusoidal drift to break perfect-tracking detection.
-        val drifted = applyDrift(clamped)
-
-        // Step 3: add gaussian noise to destroy GCD detection.
-        val noised = applyNoise(drifted)
+        // Reconstruct the clamped rotation for the debugger snapshot.
+        // (PolarBypassPureMath.process returns only the final noised value,
+        // so we recompute the clamped value here. This is cheap.)
+        val clamped = PolarBypassPureMath.clampDelta(
+            currentRotation, targetRotation, maxYawDelta, maxPitchDelta
+        )
 
         // Step 4: remember the emitted value for the next tick's clamp.
         lastEmittedRotation = noised
@@ -193,86 +197,6 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         )
 
         return noised
-    }
-
-    /**
-     * Clamp the yaw/pitch delta from current to target so we never
-     * exceed the per-tick human envelope. If the target is already
-     * within the envelope, returns target unchanged.
-     */
-    private fun clampDelta(current: Rotation, target: Rotation): Rotation {
-        val yawDiff = wrapDegrees(target.yaw - current.yaw)
-        val pitchDiff = target.pitch - current.pitch
-
-        val clampedYaw = current.yaw + yawDiff.coerceIn(-maxYawDelta, maxYawDelta)
-        val clampedPitch = current.pitch + pitchDiff.coerceIn(-maxPitchDelta, maxPitchDelta)
-
-        return Rotation(clampedYaw, clampedPitch)
-    }
-
-    /**
-     * Apply a slow sinusoidal drift so the crosshair never sits
-     * perfectly still on the target hitbox center.
-     *
-     * The drift uses two different frequencies for yaw and pitch
-     * (yaw uses the base frequency, pitch uses 1.3×) so the resulting
-     * Lissajous figure is non-repeating over short windows.
-     */
-    private fun applyDrift(rotation: Rotation): Rotation {
-        if (driftAmplitude <= 0f) return rotation
-
-        val t = tickCounter * 0.05f  // 20 tps → seconds
-        val omega = driftFrequency * 2f * Math.PI.toFloat()
-
-        val yawDrift = driftAmplitude * cos(omega * t)
-        val pitchDrift = driftAmplitude * 0.6f * sin(omega * 1.3f * t)
-
-        return Rotation(rotation.yaw + yawDrift, rotation.pitch + pitchDrift)
-    }
-
-    /**
-     * Add gaussian noise to yaw and pitch. Polar's GCD check operates
-     * on the integer-quantized yaw sent in PlayerMoveC2SPacket (which
-     * is `byte`-quantized to /256 in 1.8 and `float` in 1.9+).
-     *
-     * In 1.9+ the float yaw is full-precision, so even 0.04° of noise
-     * is enough to make the GCD of any window converge to ~0.
-     *
-     * In 1.8 the byte quantization (256 levels per 360°) means
-     * 0.04° of noise is BELOW the quantization step (1.4°), so the
-     * noise has no effect — but the byte quantization itself is the
-     * dominant GCD source on 1.8, and there is nothing we can do
-     * about it client-side. Users on 1.8 should use a different bypass.
-     */
-    private fun applyNoise(rotation: Rotation): Rotation {
-        if (noiseStddev <= 0f) return rotation
-
-        val yawNoise = gaussianNoise() * noiseStddev
-        val pitchNoise = gaussianNoise() * noiseStddev
-
-        return Rotation(rotation.yaw + yawNoise, rotation.pitch + pitchNoise)
-    }
-
-    /**
-     * Box-Muller gaussian noise generator. Mean=0, stddev=1.
-     * Seeded by Random.Default so it is non-deterministic per-tick.
-     */
-    private fun gaussianNoise(): Float {
-        val u1 = Random.nextFloat().coerceAtLeast(Float.MIN_VALUE)
-        val u2 = Random.nextFloat()
-        val z0 = kotlin.math.sqrt(-2f * kotlin.math.ln(u1)) *
-            cos(2f * Math.PI.toFloat() * u2)
-        return z0
-    }
-
-    /**
-     * Wrap an angle to [-180, 180].
-     */
-    private fun wrapDegrees(degrees: Float): Float {
-        var d = degrees
-        while (d > 180f) d -= 360f
-        while (d < -180f) d += 360f
-        return d
     }
 
     /**

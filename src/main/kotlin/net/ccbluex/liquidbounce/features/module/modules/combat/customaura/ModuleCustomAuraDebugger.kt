@@ -44,7 +44,6 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Date
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -82,10 +81,23 @@ object ModuleCustomAuraDebugger : ClientModule(
     private val showOverlay by boolean("ShowOverlay", true)
 
     /**
+     * Vertical offset (in pixels) of the overlay from the top of the screen.
+     * Useful to avoid overlapping with other HUD elements.
+     */
+    private val overlayYOffset by int("OverlayYOffset", 60, 0..500, "px")
+
+    /**
      * Whether to count PolarBypass clamp events and warn if they fire
      * too often (sign of over-aggressive base angle smooth).
      */
     private val monitorPolarBypass by boolean("MonitorPolarBypass", true)
+
+    /**
+     * Clamp ratio threshold (in percent) above which the PolarBypass health
+     * monitor warns in chat. Default 30% — if more than 30% of process()
+     * calls engage the clamp, the base AngleSmooth is too aggressive.
+     */
+    private val clampWarnThreshold by int("ClampWarnThreshold", 30, 5..95, "%")
 
     /**
      * One entry in the attack-event ring buffer. Captures the full state
@@ -127,6 +139,9 @@ object ModuleCustomAuraDebugger : ClientModule(
 
     /**
      * Statistics counters. AtomicLong so they are thread-safe.
+     *
+     * These are CUMULATIVE since module enable — they never decrease.
+     * For a sliding-window view of skip reasons, see [skipReasonWindow].
      */
     private val totalAttempts = AtomicLong(0)
     private val totalLanded = AtomicLong(0)
@@ -134,11 +149,30 @@ object ModuleCustomAuraDebugger : ClientModule(
     private val totalFailed = AtomicLong(0)
 
     /**
-     * Skip-reason histogram. Uses ConcurrentHashMap so we can read and
-     * write without explicit synchronization. Values are AtomicInteger
-     * so incrementAndGet is atomic.
+     * Skip-reason histogram with a sliding window.
+     *
+     * The previous implementation used a cumulative ConcurrentHashMap
+     * that became meaningless after an hour of play (top-3 reasons
+     * frozen forever). This implementation keeps the last
+     * [skipReasonWindowTicks] of skip events in a ring buffer, and the
+     * overlay/top-3 computation only counts events within the window.
+     *
+     * The window is defined in ticks (20 ticks = 1 second). Default
+     * 1000 ticks = 50 seconds — long enough to see trends, short enough
+     * to react to changes.
      */
-    private val skipReasons = ConcurrentHashMap<String, AtomicInteger>()
+    private val skipReasonWindowTicks by int("SkipReasonWindow", 1000, 100..6000, "ticks")
+
+    private data class SkipEvent(val tick: Long, val reason: String)
+
+    private val skipReasonWindow = java.util.concurrent.ConcurrentLinkedDeque<SkipEvent>()
+    private val skipReasonWindowCount = AtomicInteger(0)
+
+    /**
+     * Maximum number of skip events to keep in memory. Prevents
+     * unbounded growth if the window is large and skip rate is high.
+     */
+    private val skipReasonWindowMaxSize = 5000
 
     /**
      * PolarBypass clamp monitor — counts how often the per-tick yaw
@@ -202,7 +236,8 @@ object ModuleCustomAuraDebugger : ClientModule(
         totalLanded.set(0)
         totalSkipped.set(0)
         totalFailed.set(0)
-        skipReasons.clear()
+        skipReasonWindow.clear()
+        skipReasonWindowCount.set(0)
         pbClampEvents.set(0)
         pbTotalProcess.set(0)
         lastPbClampedYaw = null
@@ -292,9 +327,13 @@ object ModuleCustomAuraDebugger : ClientModule(
             "SKIPPED" -> {
                 totalSkipped.incrementAndGet()
                 skipReason?.let { reason ->
-                    // ConcurrentHashMap.compute is atomic — no synchronized needed.
-                    skipReasons.compute(reason) { _, v ->
-                        (v ?: AtomicInteger(0)).also { it.incrementAndGet() }
+                    // Add to the sliding window. Eviction of stale entries
+                    // happens lazily in [topSkipReasons] when the overlay
+                    // reads the window — this keeps the write path O(1).
+                    skipReasonWindow.addLast(SkipEvent(event.tick, reason))
+                    while (skipReasonWindowCount.incrementAndGet() > skipReasonWindowMaxSize) {
+                        skipReasonWindow.pollFirst()
+                        skipReasonWindowCount.decrementAndGet()
                     }
                 }
             }
@@ -352,11 +391,13 @@ object ModuleCustomAuraDebugger : ClientModule(
         // This ensures logs are flushed even when the game is lagging
         // (e.g. on Polar servers under load where TPS can drop to 5).
 
-        // PolarBypass health warning — if clamp fires more than 30% of
-        // the time over the last 100 process calls, warn in chat.
+        // PolarBypass health warning — if clamp fires more than
+        // [clampWarnThreshold]% of the time over the last 100 process
+        // calls, warn in chat. The threshold is user-configurable.
         if (monitorPolarBypass && pbTotalProcess.get() >= 100) {
             val ratio = pbClampEvents.get().toDouble() / pbTotalProcess.get().toDouble()
-            if (ratio > 0.30) {
+            val threshold = clampWarnThreshold.toDouble() / 100.0
+            if (ratio > threshold) {
                 // Only warn once per 1000 ticks to avoid spam.
                 if (player.age % 1000 == 0) {
                     chat(
@@ -412,21 +453,19 @@ object ModuleCustomAuraDebugger : ClientModule(
                 val ratio = pbClampEvents.get() * 100 / pbTotalProcess.get()
                 add("§7PB clamp: §f${pbClampEvents.get()}/${pbTotalProcess.get()} ($ratio%)")
             }
-            // Skip reasons top 3 — ConcurrentHashMap iteration is weakly consistent
-            // and safe without explicit synchronization.
-            val top3 = skipReasons.entries
-                .sortedByDescending { it.value.get() }
-                .take(3)
+            // Skip reasons top 3 — sliding window. Evicts stale entries
+            // (older than [skipReasonWindowTicks]) lazily on read.
+            val top3 = topSkipReasons(player.age)
             if (top3.isNotEmpty()) {
                 add("")
-                add("§7Top skip reasons:")
+                add("§7Top skip reasons (last ${skipReasonWindowTicks}t):")
                 top3.forEach { (reason, count) ->
-                    add(" §c$reason§7: §f${count.get()}")
+                    add(" §c$reason§7: §f$count")
                 }
             }
         }
 
-        val yOffset = 60
+        val yOffset = overlayYOffset
         lines.forEachIndexed { idx, line ->
             ctx.drawTextWithShadow(
                 textRenderer,
@@ -499,6 +538,48 @@ object ModuleCustomAuraDebugger : ClientModule(
     }
 
     /**
+     * Returns the top-N skip reasons within the sliding window ending at
+     * [currentTick]. Stale entries (older than [skipReasonWindowTicks])
+     * are evicted from the deque as a side effect — this lazy eviction
+     * keeps the write path O(1).
+     */
+    private fun topSkipReasons(currentTick: Long, limit: Int = 3): List<Pair<String, Int>> {
+        val minTick = currentTick - skipReasonWindowTicks
+        val counts = HashMap<String, Int>()
+        // Snapshot the deque to avoid concurrent modification during iteration.
+        val snapshot = skipReasonWindow.toList()
+
+        // Evict stale entries from the front of the deque (they are oldest).
+        // Use a count guard to avoid O(n) size() calls.
+        var evicted = 0
+        val iter = skipReasonWindow.iterator()
+        while (iter.hasNext()) {
+            val event = iter.next()
+            if (event.tick < minTick) {
+                iter.remove()
+                evicted++
+            } else {
+                break  // deque is ordered by tick, so we can stop early
+            }
+        }
+        if (evicted > 0) {
+            skipReasonWindowCount.addAndGet(-evicted)
+        }
+
+        // Count reasons in the snapshot (only those within the window).
+        for (event in snapshot) {
+            if (event.tick >= minTick) {
+                counts.merge(event.reason, 1, Int::plus)
+            }
+        }
+
+        return counts.entries
+            .sortedByDescending { it.value }
+            .take(limit)
+            .map { it.key to it.value }
+    }
+
+    /**
      * Dump the current ring buffer as a multi-line string, for use by
      * a future .customauradump command or crash reporter.
      */
@@ -508,7 +589,8 @@ object ModuleCustomAuraDebugger : ClientModule(
         pw.println("# CustomAura ring buffer dump at ${Date()}")
         pw.println("# Total attempts: ${totalAttempts.get()}, landed: ${totalLanded.get()}, " +
             "skipped: ${totalSkipped.get()}, failed: ${totalFailed.get()}")
-        pw.println("# Skip reasons: ${skipReasons.entries.associate { it.key to it.value.get() }}")
+        pw.println("# Skip reasons (sliding window, last ${skipReasonWindowTicks}t): " +
+            "${topSkipReasons(player.age, limit = 100).toMap()}")
         pw.println("# ---")
         ringBuffer.forEach { event ->
             pw.println("${event.timestamp} | tick=${event.tick} | ${event.phase}" +
@@ -522,7 +604,9 @@ object ModuleCustomAuraDebugger : ClientModule(
                 " | onGround=${event.onGround}" +
                 " | validate=${event.validateAttack}" +
                 " | yaw=${event.yaw}" +
-                " | serverYaw=${event.serverYaw}")
+                " | serverYaw=${event.serverYaw}" +
+                " | pbClampedYaw=${event.pbClampedYaw}" +
+                " | pbNoisedYaw=${event.pbNoisedYaw}")
         }
         return sw.toString()
     }
