@@ -1,8 +1,8 @@
 /*
  * AngleMath — shared angle math utilities for CustomAura.
  *
- * Previously, [wrapDegrees] was duplicated in both [CustomAuraPolarBypass]
- * and [CustomAuraAntiCheater] (and as a member of [PolarBypassPureMath]).
+ * Previously, [wrapDegrees] was duplicated in [CustomAuraPolarBypass]
+ * (and as a member of [PolarBypassPureMath]).
  * This file centralizes the float-based angle wrap so all call sites share
  * a single, O(1) implementation.
  *

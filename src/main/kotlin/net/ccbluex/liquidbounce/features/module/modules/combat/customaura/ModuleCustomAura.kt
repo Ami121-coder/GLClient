@@ -1,5 +1,5 @@
 /*
- * CustomAura module — a Polar-optimized KillAura rewrite.
+ * CustomAura module — Polar-optimized KillAura rewrite.
  *
  * Key differences vs. the stock ModuleKillAura:
  *  - NEVER uses SNAP / ON_TICK rotation timing (those trigger Polar AimA/B).
@@ -12,16 +12,25 @@
  *  - Criticals are achieved via jump-crits only, never via stop-sprint
  *    (Polar Criticals B detects sprint-stop-then-hit).
  *  - GCD-safe angle smooth is used by default (Polar AimB / GCD check).
- *  - Adaptive reach optimization so we always strike at maximum safe range,
- *    out-clicking cheaters who use shorter / less accurate reach.
- *  - Anti-cheater target prioritizer — detects enemy cheaters by their
- *    rotation snap patterns and prioritizes them, so we out-click them.
+ *  - Adaptive reach optimization so we always strike at maximum safe range.
+ *
+ * BUGFIXES vs. previous revision:
+ *  - facingEnemy now uses plain `range` (not `effectiveRange` with jitter)
+ *    to avoid ~50% of clicks being skipped when enemy is at the edge of
+ *    reach. Jitter is only applied to the actual strike distance for
+ *    anti-detection noise, NOT to the facing check.
+ *  - Target circle is no longer drawn when enemy is outside attack range
+ *    (previously the circle was drawn up to range+scanExtraRange = 4.85
+ *    blocks but attacks only landed up to ~3.85 blocks, creating the
+ *    "circle but no hit" symptom).
+ *  - Presets system removed — configuration is now direct via settings.
+ *  - AntiCheater detector removed.
+ *  - AutoJumpForCrits removed (caused rotation desync on jump).
  */
 @file:Suppress("WildcardImport", "MagicNumber")
 package net.ccbluex.liquidbounce.features.module.modules.combat.customaura
 
 import net.ccbluex.liquidbounce.event.Sequence
-import net.ccbluex.liquidbounce.event.events.MovementInputEvent
 import net.ccbluex.liquidbounce.event.events.RotationUpdateEvent
 import net.ccbluex.liquidbounce.event.events.SprintEvent
 import net.ccbluex.liquidbounce.event.events.WorldRenderEvent
@@ -31,7 +40,6 @@ import net.ccbluex.liquidbounce.config.types.NamedChoice
 import net.ccbluex.liquidbounce.features.module.Category
 import net.ccbluex.liquidbounce.features.module.ClientModule
 import net.ccbluex.liquidbounce.features.module.modules.combat.ModuleAutoWeapon
-import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAntiCheater
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraAutoBlock
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraFailSwing
 import net.ccbluex.liquidbounce.features.module.modules.combat.customaura.features.CustomAuraPolarBypass
@@ -62,33 +70,17 @@ import kotlin.math.pow
 import kotlin.random.Random
 
 /**
- * Minimum effective range (in blocks) after applying reach jitter.
- * 2.5 is well above the typical "too close to hit" threshold and
- * prevents the jitter from accidentally shrinking the range to a
- * value that would make Polar suspect a reach-consistency check.
- */
-private const val EFFECTIVE_RANGE_MIN = 2.5f
-
-/**
  * Maximum effective range (in blocks) after applying reach jitter.
  * 4.4 is below vanilla 4.5 so we never trip the vanilla Reach check.
  */
 private const val EFFECTIVE_RANGE_MAX = 4.4f
 
 /**
- * Minimum delay (in milliseconds) between two auto-jumps triggered by
- * [autoJumpForCrits]. 600ms ≈ 12 ticks at 20 TPS — long enough that
- * Polar's jump-pattern correlation check never sees a periodic signal.
- */
-private const val AUTO_JUMP_RATE_LIMIT_MS = 600L
-
-/**
- * CustomAura — Polar-bypass KillAura with anti-cheater prioritization.
+ * CustomAura — Polar-bypass KillAura.
  *
  * Design goals (in priority order):
  *  1. Survive Polar: never produce a flaggable packet sequence.
- *  2. Out-click competing cheaters via higher effective hit-rate at max safe reach.
- *  3. Stay smooth enough to look like a human on replay review.
+ *  2. Stay smooth enough to look like a human on replay review.
  */
 object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = arrayOf("CustomKillAura")) {
 
@@ -103,27 +95,12 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * correlate attack distance to a fixed value (Reach GCD check).
      */
     internal var range by float("Range", 3.85f, 1f..4.4f).onChange { r ->
-        // If the user lowers `range` below the current `wallRange`, clamp
-        // wallRange down too — otherwise we'd attack through walls at a
-        // longer range than we attack through air, which is both a logical
-        // bug and a direct Polar AimC flag.
         if (wallRange > r) {
             wallRange = r
         }
         r
     }
     internal var wallRange by float("WallRange", 0f, 0f..3f).onChange { v ->
-        // Wall range must never exceed main range. The previous
-        // implementation returned `range` (which can be up to 4.4) when v >
-        // range, violating the 0..3 bound on this setting. We now clamp to
-        // `min(v, range)` AND additionally cap to the setting's own upper
-        // bound (3.0) so the invariant `wallRange <= min(range, 3.0)` always
-        // holds.
-        //
-        // Note: `range` is read via a local helper with an explicit Float
-        // return type to break the recursive type-inference cycle that
-        // occurs when both `range` and `wallRange` are initialized as
-        // sibling delegated properties in the same class init block.
         val rangeValue: Float = currentRange()
         val clamped: Float = v.coerceAtMost(rangeValue).coerceAtMost(3f)
         if (clamped != v) clamped else v
@@ -131,9 +108,7 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
     /**
      * Helper used by [wallRange]'s onChange lambda to read [range] with an
-     * explicitly-typed return, breaking the recursive type inference that
-     * Kotlin otherwise hits when both delegated properties are being
-     * initialized at the same time.
+     * explicitly-typed return, breaking the recursive type inference.
      */
     private fun currentRange(): Float = range
 
@@ -141,6 +116,11 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * Per-attack reach jitter — adds up to ±0.05 blocks of randomization
      * to the effective strike distance so Polar's Reach sample distribution
      * looks noisy instead of pinned to a constant.
+     *
+     * IMPORTANT: jitter is applied to the ACTUAL strike distance only,
+     * NOT to the facingEnemy check. Using jitter in facingEnemy caused
+     * ~50% of clicks to be skipped when the enemy was at the edge of
+     * `range` (jitter < 0 → effectiveRange < range → facing check fails).
      */
     internal var reachJitter by float("ReachJitter", 0.05f, 0f..0.2f)
 
@@ -154,10 +134,9 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     private var currentScanExtraRange: Float = scanExtraRange.random()
 
     /**
-     * Target tracker — extends the base tracker with anti-cheater detection.
+     * Target tracker.
      */
     val targetTracker = tree(CustomAuraTargetTracker)
-    val antiCheater = tree(CustomAuraAntiCheater)
 
     /**
      * Rotation engine — uses PolarBypass processor stack by default.
@@ -173,7 +152,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     /**
      * Raycast mode — TRACE_ALL is safest: server sees us hit whatever is
      * actually under the crosshair, which matches the client raytrace.
-     * TRACE_ONLYENEMY is riskier (Polar can correlate target-switch patterns).
      */
     internal var raycast by enumChoice("Raycast", RaycastMode.TRACE_ALL)
 
@@ -184,23 +162,11 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * right before an attack packet.
      *
      * With JUMP_ONLY, attacks ALWAYS go through — vanilla Minecraft
-     * decides if it's a critical based on the onGround flag. To actually
-     * GET criticals, enable [autoJumpForCrits] below.
+     * decides if it's a critical based on the onGround flag. The user
+     * must jump manually for crits (auto-jump was removed because it
+     * caused rotation desync on the jump tick).
      */
     internal var criticalsMode by enumChoice("Criticals", CriticalsMode.JUMP_ONLY)
-
-    /**
-     * Auto-jump right before an attack to trigger a vanilla critical hit.
-     * OFF by default — auto-jumping with too regular a pattern can be
-     * detected by Polar as a movement anomaly.
-     *
-     * When ON, the aura schedules a jump on the tick before an attack
-     * (only if the player is on ground and JUMP_ONLY criticals are set).
-     * The jump is rate-limited to at most once every 600ms to avoid
-     * triggering any jump-pattern checks.
-     */
-    internal var autoJumpForCrits by boolean("AutoJumpForCrits", false)
-    private var lastAutoJumpMs: Long = 0L
     internal var keepSprint by boolean("KeepSprint", false)
 
     /**
@@ -210,115 +176,23 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      */
     internal var ignoreOpenInventory by boolean("IgnoreOpenInventory", false)
 
-    /**
-     * Anticheat preset — applies a complete configuration bundle tuned
-     * for a specific anticheat. The default is AUTO, which picks a
-     * concrete preset based on the current server.
-     *
-     * Selecting a preset overwrites ALL tunable settings on this module
-     * and its submodules. This is intentional — a preset is an explicit
-     * user action.
-     *
-     * The flagship preset is **POLAR**, which is the safest configuration
-     * that still deals meaningful damage on Polar-protected servers.
-     */
-    var preset by enumChoice("Preset", CustomAuraPresets.Preset.AUTO).onChanged { p ->
-        applyPreset(p)
-    }
-
     init {
         tree(CustomAuraAutoBlock)
         tree(CustomAuraFailSwing)
     }
 
     /**
-     * Target rendering — same as stock, no behavior change.
+     * Target rendering — only draws the target circle when the enemy is
+     * within actual strike range. Previously the circle was drawn for any
+     * tracked target (up to range+scanExtraRange = 4.85 blocks), but
+     * attacks only landed up to `range` (~3.85), causing the
+     * "circle visible but no hits" symptom.
      */
     private val targetRenderer = tree(WorldTargetRenderer(this))
 
     override fun disable() {
         targetTracker.reset()
-        antiCheater.reset()
         CustomAuraAutoBlock.stopBlocking()
-    }
-
-    // ── Preset application ──────────────────────────────────────────────────
-
-    /**
-     * Applies a preset's parameter bundle to the module's settings AND
-     * to all submodules (PolarBypass, AutoBlock, FailSwing, AntiCheater).
-     *
-     * Each setting is written via its delegated `setValue` operator,
-     * which calls the underlying `Value.set()` method and triggers any
-     * registered `onChange` listeners.
-     *
-     * Settings that the user has manually overridden since module enable
-     * will be overwritten — this is intentional, since selecting a preset
-     * is an explicit user action.
-     */
-    fun applyPreset(p: CustomAuraPresets.Preset) {
-        val resolved = CustomAuraPresets.resolve(p)
-        val params = CustomAuraPresets.paramsFor(resolved)
-
-        // ── DEBUG: preset application ────────────────────────────────
-        // Use the lazy inline extension so the value lambdas are only
-        // invoked when ModuleDebug is actually running.
-        this.debugParameter("PresetRequested") { p.name }
-        this.debugParameter("PresetResolved") { resolved.name }
-        this.debugParameter("PresetRange") { params.range }
-        this.debugParameter("PresetWallRange") { params.wallRange }
-        this.debugParameter("PresetPolarBypass") { params.polarBypassEnabled }
-        this.debugParameter("PresetAutoBlock") { params.autoBlockEnabled }
-        this.debugParameter("PresetFailSwing") { params.failSwingEnabled }
-        this.debugParameter("PresetAntiCheater") { params.antiCheaterEnabled }
-
-        // ── Main module settings ─────────────────────────────────────
-        // Order matters: write `range` BEFORE `wallRange` so the
-        // wallRange onChange listener sees the new range when clamping.
-        // The previous implementation wrote them in the opposite order,
-        // which could leave wallRange clamped to the OLD range until the
-        // user manually re-toggled it.
-        range = params.range
-        wallRange = params.wallRange
-        reachJitter = params.reachJitter
-        scanExtraRange = params.scanExtraRangeStart..params.scanExtraRangeEnd
-        // Re-roll [currentScanExtraRange] so the new preset's scan range
-        // takes effect immediately. The onChanged listener for
-        // [scanExtraRange] ALSO sets this, but only when the user changes
-        // the value via the GUI — programmatic writes from applyPreset
-        // go through the same path, but re-rolling here is a belt-and-
-        // suspenders guarantee.
-        currentScanExtraRange = scanExtraRange.random()
-        raycast = params.raycast
-        criticalsMode = params.criticalsMode
-        autoJumpForCrits = params.autoJumpForCrits
-        keepSprint = params.keepSprint
-        ignoreOpenInventory = params.ignoreOpenInventory
-
-        // ── Clicker ─────────────────────────────────────────────────
-        // Re-assert the cooldown-respect flag so a preset switch can't
-        // leave the user in cooldown-bypass mode (Polar ClickB flag).
-        clickScheduler.forceAttackCooldownEnabled()
-
-        // ── PolarBypass ──────────────────────────────────────────────
-        CustomAuraPolarBypass.applyPreset(params)
-
-        // ── AutoBlock ────────────────────────────────────────────────
-        CustomAuraAutoBlock.applyPreset(params)
-
-        // ── FailSwing ────────────────────────────────────────────────
-        CustomAuraFailSwing.applyPreset(params)
-
-        // ── AntiCheater ──────────────────────────────────────────────
-        CustomAuraAntiCheater.applyPreset(params)
-
-        // ── Reset transient state ──────────────────────────────────
-        // Clear the pending auto-jump flag so a preset switch mid-combat
-        // doesn't leave a stale jump queued. Also reset the auto-jump
-        // rate limiter so the new preset's first crit isn't delayed by
-        // the old preset's last jump timestamp.
-        pendingAutoJump = false
-        lastAutoJumpMs = 0L
     }
 
     @Suppress("unused")
@@ -329,6 +203,15 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     private fun renderTarget(matrixStack: MatrixStack, partialTicks: Float) {
         val target = targetTracker.target ?: return
         if (!targetRenderer.enabled) return
+
+        // Only render the target circle when the enemy is within
+        // actual strike range (range + a tiny epsilon for floating-point).
+        // This prevents the "circle but no hit" UX when the enemy is in
+        // the scan range (range+scanExtraRange) but not yet strikeable.
+        val squaredStrikeRange = range.pow(2)
+        if (player.squaredBoxedDistanceTo(target) > squaredStrikeRange) {
+            return
+        }
 
         renderEnvironmentForWorld(matrixStack) {
             targetRenderer.render(this, target, partialTicks)
@@ -352,11 +235,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             targetTracker.reset()
             return@handler
         }
-
-        // Anti-cheater statistics are updated automatically by the
-        // CustomAuraAntiCheater tick handler on every game tick, so we
-        // don't need to trigger it manually here. The latest cheater
-        // scores are already available via antiCheater.score(entity).
 
         updateTarget()
         ModuleAutoWeapon.prepare(targetTracker.target)
@@ -426,13 +304,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
      * re-enable sprint on the same tick — which itself is a Polar
      * NoSlow flag. So we explicitly block the SprintEvent here when the
      * attack is in progress AND we are airborne.
-     *
-     * The previous implementation also required `!player.isOnGround`,
-     * which made `shouldBlockSprinting` always FALSE on the click tick
-     * (since [pendingAutoJump] hadn't fired yet). That defeated the
-     * purpose: keepSprint was always `true` on the click tick, and
-     * since vanilla attacks with `sprint=true` NEVER crit, the JUMP_ONLY
-     * mode was effectively non-functional.
      */
     val shouldBlockSprinting
         get() = criticalsMode == CriticalsMode.JUMP_ONLY
@@ -449,37 +320,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     }
 
     /**
-     * Flag set by [attackTarget] when we want to auto-jump for a critical
-     * on the next movement tick. The actual jump is triggered via
-     * [MovementInputEvent] (see [movementInputHandler]) so it goes through
-     * the vanilla input pipeline — Polar's jump-input correlation check
-     * sees a legitimate jump input, not a velocity-only teleport.
-     *
-     * TIMING: [pendingAutoJump] is set ONE TICK BEFORE the next click
-     * tick (when [clickScheduler.willClickAt] predicts a click at +1).
-     * The jump fires on the next MovementInputEvent, the player leaves
-     * the ground on the next movement packet, and the attack on the
-     * following tick lands while the player is airborne → critical hit.
-     *
-     * The previous implementation set [pendingAutoJump] on the click
-     * tick itself, which meant the jump and the attack happened in the
-     * same tick — the movement packet for that tick had onGround=true
-     * (the jump hadn't been processed yet), so the attack was NOT a
-     * critical. Only the NEXT attack (after the player was airborne)
-     * could crit, and by then the click scheduler might have moved on.
-     */
-    @Volatile
-    private var pendingAutoJump: Boolean = false
-
-    @Suppress("unused")
-    private val movementInputHandler = handler<MovementInputEvent> {
-        if (pendingAutoJump && player.isOnGround) {
-            it.jump = true
-            pendingAutoJump = false
-        }
-    }
-
-    /**
      * Core attack routine. Compared to stock KillAura:
      *  - No inventory close/open dance.
      *  - No dual PlayerMoveC2SPacket on ON_TICK timing.
@@ -492,14 +332,23 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
 
         // Apply per-tick reach jitter so the strike distance is noisy.
         // Use kotlin.random.Random (not Math.random) for cross-platform
-        // determinism in tests, and to avoid the unnecessary Double→Float
-        // round-trip of the previous implementation.
+        // determinism in tests.
         val jitter = reachJitter * (Random.nextFloat() * 2f - 1f)
-        val effectiveRange = (range + jitter).coerceIn(EFFECTIVE_RANGE_MIN, EFFECTIVE_RANGE_MAX)
+        val effectiveRange = (range + jitter).coerceAtMost(EFFECTIVE_RANGE_MAX)
 
+        // BUGFIX: facingEnemy uses `range` (NOT `effectiveRange`).
+        // The previous implementation passed effectiveRange, which meant
+        // that whenever jitter < 0 the effective range shrank below `range`
+        // and the facing check failed for enemies at the edge of reach.
+        // This caused ~50% of click ticks to be skipped whenever the enemy
+        // was at 3.75-3.85 blocks (with default Polar settings), producing
+        // the "aura locks target but doesn't hit" symptom.
+        //
+        // Jitter is now applied ONLY to the actual strike distance for
+        // anti-detection noise, NOT to the facing check.
         val isFacingEnemy = facingEnemy(
             toEntity = target, rotation = rotation,
-            range = effectiveRange.toDouble(),
+            range = range.toDouble(),
             wallsRange = wallRange.toDouble()
         )
 
@@ -510,7 +359,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         this.debugParameter("Jitter") { jitter }
         this.debugParameter("IsFacingEnemy") { isFacingEnemy }
         this.debugParameter("IsClickTick") { clickScheduler.isClickTick }
-        this.debugParameter("Preset") { preset.name }
         this.debugParameter("CriticalsMode") { criticalsMode.name }
         this.debugParameter("OnGround") { player.isOnGround }
         this.debugParameter("RequirementsMet") { requirementsMet }
@@ -559,29 +407,6 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
             return
         }
 
-        // Pre-click auto-jump for criticals. This MUST run BEFORE the
-        // `isClickTick` check below, because the jump needs to fire on
-        // the tick BEFORE the click — not on the click tick itself.
-        //
-        // Sequence: t=0 (willClickAt(1)=true, onGround=true) → set
-        // pendingAutoJump → t=1 (jump fires via MovementInputEvent,
-        // player leaves ground) → t=2 (isClickTick=true, attack lands
-        // while airborne → CRITICAL).
-        //
-        // The previous implementation had this block INSIDE the
-        // `if (clickScheduler.isClickTick ...)` branch, which meant it
-        // only fired on the click tick — too late for the jump to put
-        // the player airborne before the attack.
-        if (isFacingEnemy && autoJumpForCrits && criticalsMode == CriticalsMode.JUMP_ONLY &&
-            player.isOnGround && targetTracker.target != null &&
-            clickScheduler.willClickAt(1) && validateAttack(target)) {
-            val now = System.currentTimeMillis()
-            if (now - lastAutoJumpMs >= AUTO_JUMP_RATE_LIMIT_MS) {
-                pendingAutoJump = true
-                lastAutoJumpMs = now
-            }
-        }
-
         // Strike — click scheduler gates the actual hit.
         if (clickScheduler.isClickTick && validateAttack(target)) {
             ModuleCustomAuraDebugger.recordEvent(
@@ -614,22 +439,19 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
                 // With JUMP_ONLY criticals, we do NOT skip the attack when
                 // on ground — vanilla Minecraft decides if it's a critical
                 // based on the onGround flag in the movement packet. If the
-                // player is in the air (from a manual or auto jump), it's
-                // a crit; if on ground, it's a normal hit. Both are legit.
+                // player is in the air (from a manual jump), it's a crit;
+                // if on ground, it's a normal hit. Both are legit.
                 //
                 // FIRST ARG of Entity.attack(sprint, keepSprint) is `sprint`
                 // — whether the player is currently sprinting. Vanilla
-                // Minecraft's critical-hit check (`ModuleCriticals.wouldDoCriticalHit`)
-                // requires the player to NOT be sprinting. Passing `true`
-                // here would mark the attack as a sprint-attack, which
-                // disables criticals even if the player is airborne.
+                // Minecraft's critical-hit check requires the player to
+                // NOT be sprinting. Passing `true` here would mark the
+                // attack as a sprint-attack, which disables criticals even
+                // if the player is airborne.
                 //
-                // The previous implementation hardcoded `true`, which
-                // silently disabled crits even when [autoJumpForCrits]
-                // had correctly put the player airborne. We now pass
-                // `false` in JUMP_ONLY mode (so vanilla's crit check can
-                // fire) and `keepSprint` in NONE mode (since crits are
-                // disabled anyway, sprint state doesn't matter).
+                // We pass `false` in JUMP_ONLY mode (so vanilla's crit
+                // check can fire) and `keepSprint` in NONE mode (since
+                // crits are disabled anyway, sprint state doesn't matter).
                 val sprintArg = criticalsMode != CriticalsMode.JUMP_ONLY && keepSprint
                 val keepSprintArg = keepSprint && !shouldBlockSprinting
                 target.attack(sprintArg, keepSprintArg)
@@ -669,8 +491,8 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
     }
 
     /**
-     * Target selection. Uses the anti-cheater score to break ties so we
-     * prefer killing cheaters when multiple enemies are in range.
+     * Target selection. Sorts candidates by distance only (AntiCheater
+     * prioritization was removed in this revision).
      */
     private fun updateTarget() {
         val situation = when {
@@ -688,14 +510,12 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         val squaredMaxRange = maximumRange.pow(2)
         val squaredNormalRange = range.pow(2)
 
-        // Build candidate list with cheater score, then sort by:
-        //   1. Cheater score (desc) — out-click cheaters first.
-        //   2. In-range (in normal range first).
-        //   3. Distance (asc).
+        // Build candidate list sorted by:
+        //   1. In-range (in normal range first).
+        //   2. Distance (asc).
         val candidates = targetTracker.targets()
             .filter { it.squaredBoxedDistanceTo(player) <= squaredMaxRange }
-            .sortedWith(compareByDescending<LivingEntity> { antiCheater.score(it) }
-                .thenBy { if (it.squaredBoxedDistanceTo(player) <= squaredNormalRange) 0 else 1 }
+            .sortedWith(compareBy<LivingEntity> { if (it.squaredBoxedDistanceTo(player) <= squaredNormalRange) 0 else 1 }
                 .thenBy { it.squaredBoxedDistanceTo(player) })
 
         val target = candidates.firstOrNull { processTarget(it, maximumRange, situation) }
@@ -710,12 +530,10 @@ object ModuleCustomAura : ClientModule("CustomAura", Category.COMBAT, aliases = 
         if (target != null) {
             targetTracker.target = target
             this.debugParameter("TargetID") { target.id }
-            this.debugParameter("TargetScore") { antiCheater.score(target) }
             this.debugParameter("TargetDist") { target.squaredBoxedDistanceTo(player) }
         } else {
             targetTracker.reset()
             this.debugParameter("TargetID") { "none" }
-            this.debugParameter("TargetScore") { 0f }
         }
     }
 

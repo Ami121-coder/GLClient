@@ -205,7 +205,6 @@ object ModuleCustomAuraDebugger : ClientModule(
         val onGround: Boolean?,
         val validateAttack: Boolean?,
         val criticalsMode: String?,
-        val preset: String?,
         val yaw: Float?,
         val pitch: Float?,
         val serverYaw: Float?,
@@ -415,7 +414,6 @@ object ModuleCustomAuraDebugger : ClientModule(
             onGround = onGround,
             validateAttack = validateAttack,
             criticalsMode = ModuleCustomAura.criticalsMode.name,
-            preset = ModuleCustomAura.preset.name,
             yaw = player.rotation.yaw,
             pitch = player.rotation.pitch,
             serverYaw = RotationManager.serverRotation.yaw,
@@ -562,7 +560,6 @@ object ModuleCustomAuraDebugger : ClientModule(
         // of growing through 3-4 reallocations as buildList does.
         val lines = ArrayList<String>(28)
         lines += "§b§lCustomAura Debug"
-        lines += "§7Preset: §f${last.preset}"
         lines += "§7Criticals: §f${last.criticalsMode}"
         lines += "§7Tick: §f${last.tick}"
         lines += ""

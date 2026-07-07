@@ -99,19 +99,4 @@ internal object CustomAuraFailSwing : ToggleableConfigurable(
             true
         }
     }
-
-    /**
-     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
-     */
-    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
-        this.enabled = params.failSwingEnabled
-        additionalRange = params.failSwingAdditionalRangeStart..params.failSwingAdditionalRangeEnd
-        minIntervalMs = params.failSwingMinIntervalMs
-        // Re-roll the per-tick additional range so the new preset's
-        // range is reflected immediately. The previous implementation
-        // left [currentAdditionalRange] holding the OLD preset's value
-        // until the next AttackEntityEvent fired, which meant the first
-        // few fail-swings after a preset switch used the wrong range.
-        currentAdditionalRange = additionalRange.random()
-    }
 }

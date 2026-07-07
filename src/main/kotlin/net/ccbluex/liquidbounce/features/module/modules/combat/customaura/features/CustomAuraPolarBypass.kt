@@ -97,8 +97,14 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
      * Sinusoidal drift amplitude. Adds a slow sinusoidal offset to yaw
      * and pitch so the crosshair never sits perfectly on the target
      * center — defeats AimC "perfect tracking" check.
+     *
+     * Lowered from 0.4° to 0.2° — at 0.4° the drift combined with
+     * PointTracker's predictive aim could push the crosshair off the
+     * hitbox edge on moving targets, causing facingEnemy to fail on
+     * ~10% of click ticks. 0.2° is still enough to defeat AimC while
+     * staying well inside the hitbox at 3.85 blocks.
      */
-    internal var driftAmplitude by float("DriftAmplitude", 0.4f, 0f..2f, "°")
+    internal var driftAmplitude by float("DriftAmplitude", 0.2f, 0f..2f, "°")
 
     /**
      * Drift frequency in Hz (oscillations per second). 0.3 Hz means a
@@ -173,19 +179,5 @@ object CustomAuraPolarBypass : ToggleableConfigurable(
         this.debugParameter("PB_DriftAmp") { driftAmplitude }
 
         return result.final
-    }
-
-    /**
-     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
-     */
-    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
-        // Toggle enabled state — VANILLA preset disables the bypass entirely.
-        this.enabled = params.polarBypassEnabled
-
-        maxYawDelta = params.maxYawDelta
-        maxPitchDelta = params.maxPitchDelta
-        noiseStddev = params.noiseStddev
-        driftAmplitude = params.driftAmplitude
-        driftFrequency = params.driftFrequency
     }
 }
