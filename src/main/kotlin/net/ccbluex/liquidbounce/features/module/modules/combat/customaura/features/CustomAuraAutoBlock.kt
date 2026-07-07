@@ -269,27 +269,6 @@ object CustomAuraAutoBlock : ToggleableConfigurable(
     private fun canBlock(itemStack: ItemStack) =
         itemStack.item?.getUseAction(itemStack) == UseAction.BLOCK
 
-    /**
-     * Apply preset parameters. Called by [ModuleCustomAura.applyPreset].
-     */
-    internal fun applyPreset(params: net.ccbluex.liquidbounce.features.module.modules.combat.customaura.CustomAuraPresets.Params) {
-        this.enabled = params.autoBlockEnabled
-        blockMode = params.blockMode
-        unblockMode = params.unblockMode
-        tickOffRange = params.tickOffStart..params.tickOffEnd
-        tickOnRange = params.tickOnStart..params.tickOnEnd
-        // Re-roll [currentTickOff] / [currentTickOn] so the new preset's
-        // tick ranges take effect on the very next block/unblock cycle.
-        // The previous implementation left them holding the OLD preset's
-        // value until the next onChanged fired.
-        currentTickOff = tickOffRange.random()
-        currentTickOn = tickOnRange.random()
-        // Clear the enforced flag so a preset switch doesn't leave us
-        // thinking we're blocking when we're not.
-        blockingStateEnforced = false
-        blockVisual = false
-    }
-
     enum class BlockMode(override val choiceName: String) : NamedChoice {
         BASIC("Basic"),
         FAKE("Fake")
