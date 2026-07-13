@@ -197,7 +197,7 @@ dependencies {
     includeDependency("org.ahocorasick:ahocorasick:0.6.3")
 
     // Test libraries
-    testImplementation("org.junit.jupiter:junit-jupiter:5.13.1")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
     // Fix nullable annotations
